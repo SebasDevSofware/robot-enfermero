@@ -165,7 +165,7 @@ void BiometricTask(void *pvParameters) {
     if (lowPowerMode) {
       // En low power, muestreamos menos frecuente
       vTaskDelay(pdMS_TO_TICKS(100)); // Reducir frecuencia a 10Hz
-      
+     
       // Intentar leer pero sin forzar
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         if (max_present) {
@@ -184,12 +184,12 @@ void BiometricTask(void *pvParameters) {
         while (particleSensor.available() && samplesCollected < MAX30102_SAMPLES) {
           redBuffer[samplesCollected] = particleSensor.getRed();
           irBuffer[samplesCollected] = particleSensor.getIR();
-          
+         
           // Acumular para calcular calidad de señal
           if (samplesCollected > 0) {
             signalQualitySum += irBuffer[samplesCollected];
           }
-          
+         
           particleSensor.nextSample();
           samplesCollected++;
         }
@@ -202,7 +202,7 @@ void BiometricTask(void *pvParameters) {
       // Calcular calidad de señal (MEJORA ELITE: barra de confianza)
       float avgSignal = signalQualitySum / MAX30102_SAMPLES;
       bool goodSignal = (avgSignal > SIGNAL_QUALITY_THRESHOLD);
-      
+     
       if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
         g_data.signalQuality = goodSignal;
         xSemaphoreGive(dataMutex);
@@ -220,7 +220,7 @@ void BiometricTask(void *pvParameters) {
             int32_t hr_sum = 0;
             for (int i = 0; i < RATE_SIZE; i++) hr_sum += hr_buffer[i];
             int32_t filteredHR = hr_sum / RATE_SIZE;
-            
+           
             if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
               g_data.heartRate = filteredHR;
               lastValidHR = filteredHR;
@@ -237,7 +237,7 @@ void BiometricTask(void *pvParameters) {
             int32_t spo2_sum = 0;
             for (int i = 0; i < SPO2_SIZE; i++) spo2_sum += spo2_buffer[i];
             int32_t filteredSpO2 = spo2_sum / SPO2_SIZE;
-            
+           
             if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
               g_data.spo2 = filteredSpO2;
               lastValidSpO2 = filteredSpO2;
@@ -374,7 +374,7 @@ void loop() {
   static unsigned long lastMPURead = 0;
   unsigned long currentMicros = micros();
   float dt = 0.01f; // Valor por defecto seguro
-  
+ 
   bool lecturaExitosa = false;
 
   if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -441,7 +441,7 @@ void loop() {
     memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
   }
-  
+ 
   if (!lowPowerMode) {  // No detectar caídas en low power
     filtroCaidas(localData.magnitude, localData.pitch);
   }
@@ -475,6 +475,8 @@ void loop() {
   delay(10);
 }
 
+// ____________________________________________
+
 // ******************************
 // * IMPLEMENTACIÓN DE FUNCIONES *
 // ******************************
@@ -483,11 +485,11 @@ void loop() {
 void calibrarNivel() {
   Serial.println("[Calibracion] Estableciendo nivel cero...");
   delay(500); // Esperar a que el sensor se estabilice
-  
+ 
   float sumPitch = 0;
   float sumRoll = 0;
   int samples = 50;
-  
+ 
   for (int i = 0; i < samples; i++) {
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
       if (mpu.update()) {
@@ -500,9 +502,9 @@ void calibrarNivel() {
         float mx = mpu.getMagX();
         float my = mpu.getMagY();
         float mz = mpu.getMagZ();
-        
+       
         aplicarFiltroMadgwick(ax, ay, az, gx, gy, gz, mx, my, mz, 0.01f);
-        
+       
         sumPitch += asin(2.0f*(q0*q2 - q3*q1)) * 180.0f / PI;
         sumRoll += atan2(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2)) * 180.0f / PI;
       }
@@ -510,17 +512,17 @@ void calibrarNivel() {
     }
     delay(10);
   }
-  
+ 
   pitchOffset = sumPitch / samples;
   rollOffset = sumRoll / samples;
-  
+ 
   Serial.printf("[Calibracion] Offset - Pitch: %.2f, Roll: %.2f\n", pitchOffset, rollOffset);
 }
 
 // --- MEJORA ELITE: Sanity Check para HR ---
 bool sanityCheckHR(int32_t newHR) {
   if (lastValidHR == 0) return true; // Primera lectura
-  
+ 
   float change = abs(newHR - lastValidHR) / (float)lastValidHR;
   return (change <= MAX_HR_CHANGE);
 }
@@ -528,7 +530,7 @@ bool sanityCheckHR(int32_t newHR) {
 // --- MEJORA ELITE: Sanity Check para SpO2 ---
 bool sanityCheckSpO2(int32_t newSpO2) {
   if (lastValidSpO2 == 0) return true;
-  
+ 
   float change = abs(newSpO2 - lastValidSpO2) / (float)lastValidSpO2;
   return (change <= MAX_HR_CHANGE); // Mismo umbral
 }
@@ -536,14 +538,14 @@ bool sanityCheckSpO2(int32_t newSpO2) {
 // --- MEJORA ELITE: Low Power Mode ---
 void checkLowPowerMode(float magnitude) {
   static unsigned long lastWakeTime = 0;
-  
+ 
   // Detectar movimiento
   if (magnitude < (1.0f + MOTION_THRESHOLD) && magnitude > (1.0f - MOTION_THRESHOLD)) {
     // En reposo (cerca de 1G)
     if (millis() - lastMotionTime > INACTIVITY_TIMEOUT && !lowPowerMode) {
       lowPowerMode = true;
       Serial.println("[LowPower] Modo ahorro activado - Sin movimiento detectado");
-      
+     
       if (oled_present) {
         display.ssd1306_command(SSD1306_DISPLAYOFF);
       }
@@ -551,11 +553,11 @@ void checkLowPowerMode(float magnitude) {
   } else {
     // Hay movimiento
     lastMotionTime = millis();
-    
+   
     if (lowPowerMode) {
       lowPowerMode = false;
       Serial.println("[LowPower] Despertando por movimiento");
-      
+     
       if (oled_present) {
         display.ssd1306_command(SSD1306_DISPLAYON);
       }
@@ -566,9 +568,9 @@ void checkLowPowerMode(float magnitude) {
 // --- INICIALIZACIÓN DEL FILTRO DE ORIENTACIÓN ---
 void inicializarFiltroOrientacion() {
   Serial.println("[Filtro] Inicializando orientacion...");
-  
+ 
   q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
-  
+ 
   for (int i = 0; i < 100; i++) {
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
       if (mpu.update()) {
@@ -581,13 +583,267 @@ void inicializarFiltroOrientacion() {
         float mx = mpu.getMagX();
         float my = mpu.getMagY();
         float mz = mpu.getMagZ();
-        
+       
         aplicarFiltroMadgwick(ax, ay, az, gx, gy, gz, mx, my, mz, 0.01f);
       }
       xSemaphoreGive(i2cMutex);
     }
     delay(10);
   }
-  
+ 
   Serial.println("[Filtro] Orientacion inicial estabilizada.");
+}
+
+// --- FILTRO DE MADGWICK ---
+void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz, float dt) {
+  float recipNorm;
+  float s0, s1, s2, s3;
+  float qDot1, qDot2, qDot3, qDot4;
+  float hx, hy;
+  float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1, _2q2, _2q3, _2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+
+  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+    recipNorm = 1.0f / sqrt(ax * ax + ay * ay + az * az);
+    ax *= recipNorm;
+    ay *= recipNorm;
+    az *= recipNorm;
+
+    recipNorm = 1.0f / sqrt(mx * mx + my * my + mz * mz);
+    mx *= recipNorm;
+    my *= recipNorm;
+    mz *= recipNorm;
+
+    _2q0mx = 2.0f * q0 * mx;
+    _2q0my = 2.0f * q0 * my;
+    _2q0mz = 2.0f * q0 * mz;
+    _2q1mx = 2.0f * q1 * mx;
+    hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2 + _2q1 * mz * q3 - mx * q2q2 - mx * q3q3;
+    hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1 + my * q2q2 + _2q2 * mz * q3 - my * q3q3;
+    _2bx = sqrt(hx * hx + hy * hy);
+    _2bz = -_2q0mx * q2 + _2q0my * q1 + mz * q0q0 + _2q1mx * q3 - mz * q1q1 + _2q2 * my * q3 - mz * q2q2 + mz * q3q3;
+    _4bx = 2.0f * _2bx;
+    _4bz = 2.0f * _2bz;
+
+    s0 = -_2q2 * (2.0f * q1q3 - _2q0q2 - ax) + _2q1 * (2.0f * q0q1 + _2q2q3 - ay) - _2bz * q2 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) + _2q0 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q1 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) + _2q3 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q2 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s3 = _2q1 * (2.0f * q1q3 - _2q0q2 - ax) + _2q2 * (2.0f * q0q1 + _2q2q3 - ay) + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+
+    recipNorm = 1.0f / sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+    s0 *= recipNorm;
+    s1 *= recipNorm;
+    s2 *= recipNorm;
+    s3 *= recipNorm;
+
+    qDot1 -= beta * s0;
+    qDot2 -= beta * s1;
+    qDot3 -= beta * s2;
+    qDot4 -= beta * s3;
+  }
+
+  q0 += qDot1 * dt;
+  q1 += qDot2 * dt;
+  q2 += qDot3 * dt;
+  q3 += qDot4 * dt;
+
+  recipNorm = 1.0f / sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  q0 *= recipNorm;
+  q1 *= recipNorm;
+  q2 *= recipNorm;
+  q3 *= recipNorm;
+}
+
+// --- FILTRO DE CAÍDAS ---
+void filtroCaidas(float mag, float inclination) {
+  bool currentFallState = false;
+  unsigned long now = millis();
+
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    currentFallState = g_data.fallDetected;
+    xSemaphoreGive(dataMutex);
+  }
+
+  if (mag > FALL_IMPACT_THRESHOLD && !currentFallState) {
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+      g_data.fallDetected = true;
+      g_data.fallTimestamp = now;
+      xSemaphoreGive(dataMutex);
+    }
+    Serial.println("!!! IMPACTO DETECTADO !!!");
+  }
+
+  if (currentFallState) {
+    if (now - g_data.fallTimestamp > FALL_INACTIVITY_TIME) {
+      if (mag > 0.8 && mag < 1.2) {
+        if (abs(inclination) > FALL_ANGLE_THRESHOLD) {
+          if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            strcpy(g_data.estadoGlobal, "CAIDA CONFIRMADA");
+            xSemaphoreGive(dataMutex);
+          }
+        } else {
+          if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            strcpy(g_data.estadoGlobal, "RECUPERADO");
+            g_data.fallDetected = false;
+            xSemaphoreGive(dataMutex);
+          }
+        }
+      } else {
+        if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+          strcpy(g_data.estadoGlobal, "MOVIMIENTO");
+          g_data.fallDetected = false;
+          xSemaphoreGive(dataMutex);
+        }
+      }
+    } else {
+      if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+        strcpy(g_data.estadoGlobal, "ANALIZANDO...");
+        xSemaphoreGive(dataMutex);
+      }
+    }
+  } else {
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+      if (mag > 2.0 && mag < 3.5)
+        strcpy(g_data.estadoGlobal, "CAMINANDO");
+      else if (mag > 3.5)
+        strcpy(g_data.estadoGlobal, "CORRIENDO");
+      else if (abs(inclination) > 70)
+        strcpy(g_data.estadoGlobal, "ACOSTADO");
+      else
+        strcpy(g_data.estadoGlobal, "ESTABLE");
+      xSemaphoreGive(dataMutex);
+    }
+  }
+}
+
+// --- ACTUALIZACIÓN DE PANTALLA OLED (con barra de calidad) ---
+void actualizarOLED() {
+  if (!oled_present) return;
+
+  SensorData localData;
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
+    xSemaphoreGive(dataMutex);
+  }
+
+  char buffer[20];
+  display.clearDisplay();
+
+  // Título
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("ALMA WRO 2026");
+  display.drawLine(0, 10, 128, 10, WHITE);
+
+  // Fila 1: BPM y SpO2
+  display.setCursor(0, 12);
+  sprintf(buffer, "BPM:%3ld SpO2:%3ld%%", localData.heartRate, localData.spo2);
+  display.print(buffer);
+
+  // MEJORA ELITE: Barra de calidad de señal
+  if (localData.signalQuality) {
+    display.fillRect(100, 14, 20, 6, WHITE);  // Barra llena = buena señal
+  } else {
+    display.drawRect(100, 14, 20, 6, WHITE);  // Solo contorno = mala señal
+  }
+
+  // Fila 2: Temperatura y Humedad
+  display.setCursor(0, 24);
+  sprintf(buffer, "T:%.1fC H:%.0f%%", localData.temperature, localData.humidity);
+  display.print(buffer);
+
+  // Fila 3: Presión
+  display.setCursor(0, 36);
+  sprintf(buffer, "P:%.1fhPa", localData.pressure);
+  display.print(buffer);
+
+  // Fila 4: Estado
+  display.setCursor(0, 48);
+  display.print("EST:");
+  display.setCursor(30, 48);
+  display.print(localData.estadoGlobal);
+
+  display.display();
+}
+
+// --- ENVÍO DE TELEMETRÍA ---
+void enviarTelemetria() {
+  SensorData localData;
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
+    xSemaphoreGive(dataMutex);
+  }
+
+  typedef struct __attribute__((packed)) {
+    uint32_t timestamp;
+    int32_t heartRate;
+    int32_t spo2;
+    float temperature;
+    float humidity;
+    float pressure;
+    float roll;
+    float pitch;
+    float yaw;
+    float magnitude;
+    char estadoGlobal[20];
+    uint8_t fallDetected;
+    uint8_t signalQuality;
+  } TelemetryPacket;
+
+  TelemetryPacket packet;
+  packet.timestamp = millis();
+  packet.heartRate = localData.heartRate;
+  packet.spo2 = localData.spo2;
+  packet.temperature = localData.temperature;
+  packet.humidity = localData.humidity;
+  packet.pressure = localData.pressure;
+  packet.roll = localData.roll;
+  packet.pitch = localData.pitch;
+  packet.yaw = localData.yaw;
+  packet.magnitude = localData.magnitude;
+  strncpy(packet.estadoGlobal, localData.estadoGlobal, sizeof(packet.estadoGlobal) - 1);
+  packet.estadoGlobal[sizeof(packet.estadoGlobal) - 1] = '\0';
+  packet.fallDetected = localData.fallDetected ? 1 : 0;
+  packet.signalQuality = localData.signalQuality ? 1 : 0;
+
+  // Envío por Serial para depuración
+  Serial.println("--- Paquete Telemetría ---");
+  Serial.printf("HR:%ld SpO2:%ld T:%.2f H:%.2f P:%.2f\n", packet.heartRate, packet.spo2, packet.temperature, packet.humidity, packet.pressure);
+  Serial.printf("Orientacion R:%.2f P:%.2f Y:%.2f Mag:%.2f\n", packet.roll, packet.pitch, packet.yaw, packet.magnitude);
+  Serial.printf("Estado:%s Fall:%d SQ:%d\n", packet.estadoGlobal, packet.fallDetected, packet.signalQuality);
+  Serial.printf("Tamaño paquete: %d bytes\n", sizeof(packet));
+}
+
+// --- REINICIO DEL BUS I2C ---
+void resetI2CBus() {
+  Serial.println("[WATCHDOG] Reiniciando bus I2C...");
+  Wire.end();
+  delay(100);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+}
+
+// --- VERIFICACIÓN DEL WATCHDOG ---
+void checkWatchdog() {
+  unsigned long now = millis();
+
+  if (now - lastTaskReset[0] > WATCHDOG_TIMEOUT) {
+    Serial.println("[WATCHDOG] Timeout en BiometricTask! Reiniciando...");
+    if (biometricTaskHandle != NULL) {
+      vTaskDelete(biometricTaskHandle);
+      xTaskCreatePinnedToCore(BiometricTask, "BiometricTask", 10000, NULL, 1, &biometricTaskHandle, 0);
+    }
+    resetI2CBus();
+    lastTaskReset[0] = millis();
+  }
+
+  if (now - lastTaskReset[1] > WATCHDOG_TIMEOUT * 2) {
+    Serial.println("[WATCHDOG] Timeout en Loop Principal! Reseteando I2C...");
+    resetI2CBus();
+    lastTaskReset[1] = millis();
+  }
 }
