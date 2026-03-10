@@ -27,9 +27,9 @@
 // OLED 0.96
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-// MLX90614 IR Thermometer (Descomentar si se usa)
-// #include <Adafruit_MLX90614.h>
+// BME280
 #include <Adafruit_BME280.h>
+// MPU
 #include "MPU9250.h"
 
 // --- Configuración de Pantalla OLED ---
@@ -88,7 +88,6 @@ typedef struct {
   // Biométricos
   int32_t heartRate;
   int32_t spo2;
-  float temperature;        // Temperatura corporal (MLX90614)
   float humidity;
   float pressure;
   // Movimiento
@@ -102,10 +101,10 @@ typedef struct {
   bool fallDetected;
   unsigned long fallTimestamp;
   // Calidad de señal
-  bool signalQuality;       // Buena señal del MAX30102?
+  bool signalQuality;
 } SensorData;
 
-volatile SensorData g_data;
+SensorData g_data;
 
 // --- Buffers y Filtros para MAX30102 ---
 uint32_t irBuffer[MAX30102_SAMPLES];
@@ -137,13 +136,13 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
 void resetI2CBus();
 void checkWatchdog();
 void inicializarFiltroOrientacion();
-void calibrarNivel();  // MEJORA ELITE: Calibración dinámica
-bool sanityCheckHR(int32_t newHR);  // MEJORA ELITE: Filtro de outliers
+void calibrarNivel();
+bool sanityCheckHR(int32_t newHR);
 bool sanityCheckSpO2(int32_t newSpO2);
-void checkLowPowerMode(float magnitude);  // MEJORA ELITE: Low Power Mode
+void checkLowPowerMode(float magnitude); 
 
 // ******************************
-// * TAREA CORE 0: BIOMETRÍA   *
+// * TAREA CORE 0: BIOMETRÍA   * ✅
 // ******************************
 void BiometricTask(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -208,7 +207,6 @@ void BiometricTask(void *pvParameters) {
         xSemaphoreGive(dataMutex);
       }
 
-      // Ejecutar el algoritmo pesado (solo si hay señal)
       if (goodSignal) {
         maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX30102_SAMPLES, redBuffer, &spo2, &validSPO2, &hr, &validHR);
 
@@ -276,7 +274,7 @@ void BiometricTask(void *pvParameters) {
 }
 
 // ******************************
-// * SETUP (CORE 1)             *
+// * SETUP (CORE 1)             * ✅
 // ******************************
 void setup() {
   Serial.begin(115200);
@@ -364,7 +362,7 @@ void setup() {
 }
 
 // ******************************
-// * LOOP PRINCIPAL (CORE 1)    *
+// * LOOP PRINCIPAL (CORE 1)    * ✅
 // ******************************
 void loop() {
   // --- 1. RESET DEL WATCHDOG ---
@@ -389,7 +387,7 @@ void loop() {
       float my = mpu.getMagY();
       float mz = mpu.getMagZ();
 
-      // MEJORA ELITE: Calcular dt de forma segura
+      // Calcular dt de forma segura
       if (currentMicros > lastMPURead) {
         dt = (currentMicros - lastMPURead) / 1000000.0f;
         // Limitar dt a valores razonables (0.001s a 0.1s)
@@ -397,18 +395,16 @@ void loop() {
         if (dt > 0.1f) dt = 0.1f;
       }
 
-      // Aplicar filtro Madgwick
       aplicarFiltroMadgwick(ax, ay, az, gx, gy, gz, mx, my, mz, dt);
 
       // Calcular magnitud y aplicar offset de calibración
       float mag = sqrt(ax*ax + ay*ay + az*az);
       float pitch = (asin(2.0f*(q0*q2 - q3*q1)) * 180.0f / PI) - pitchOffset;
       float roll = (atan2(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2)) * 180.0f / PI) - rollOffset;
+      float yaw = atan2(2.0f*(q0*q3 + q1*q2), 1.0f - 2.0f*(q2*q2 + q3*q3)) * 180.0f / PI;
 
-      // MEJORA ELITE: Verificar movimiento para Low Power
       checkLowPowerMode(mag);
 
-      // Actualizar estructura de datos global
       if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
         g_data.ax = ax;
         g_data.ay = ay;
@@ -422,7 +418,7 @@ void loop() {
         g_data.magnitude = mag;
         g_data.pitch = pitch;
         g_data.roll = roll;
-        g_data.yaw = atan2(2.0f*(q0*q3 + q1*q2), 1.0f - 2.0f*(q2*q2 + q3*q3)) * 180.0f / PI;
+        g_data.yaw = yaw;
         xSemaphoreGive(dataMutex);
       }
       lecturaExitosa = true;
@@ -442,7 +438,7 @@ void loop() {
     xSemaphoreGive(dataMutex);
   }
  
-  if (!lowPowerMode) {  // No detectar caídas en low power
+  if (!lowPowerMode) {
     filtroCaidas(localData.magnitude, localData.pitch);
   }
 
@@ -459,7 +455,6 @@ void loop() {
     if (!lowPowerMode) {
       actualizarOLED();
     } else {
-      // En low power, mantener pantalla apagada
       if (oled_present) {
         display.clearDisplay();
         display.display();
@@ -481,7 +476,7 @@ void loop() {
 // * IMPLEMENTACIÓN DE FUNCIONES *
 // ******************************
 
-// --- MEJORA ELITE: Calibración de nivel ---
+// --- Calibración de nivel --- ✅
 void calibrarNivel() {
   Serial.println("[Calibracion] Estableciendo nivel cero...");
   delay(500); // Esperar a que el sensor se estabilice
@@ -517,17 +512,16 @@ void calibrarNivel() {
   rollOffset = sumRoll / samples;
  
   Serial.printf("[Calibracion] Offset - Pitch: %.2f, Roll: %.2f\n", pitchOffset, rollOffset);
-}
+} 
 
-// --- MEJORA ELITE: Sanity Check para HR ---
+// Sanity Check para HR --- ✅
 bool sanityCheckHR(int32_t newHR) {
   if (lastValidHR == 0) return true; // Primera lectura
  
   float change = abs(newHR - lastValidHR) / (float)lastValidHR;
   return (change <= MAX_HR_CHANGE);
 }
-
-// --- MEJORA ELITE: Sanity Check para SpO2 ---
+// Sanity Check para SpO2 --- ✅
 bool sanityCheckSpO2(int32_t newSpO2) {
   if (lastValidSpO2 == 0) return true;
  
@@ -535,7 +529,7 @@ bool sanityCheckSpO2(int32_t newSpO2) {
   return (change <= MAX_HR_CHANGE); // Mismo umbral
 }
 
-// --- MEJORA ELITE: Low Power Mode ---
+// --- Low Power Mode --- ✅
 void checkLowPowerMode(float magnitude) {
   static unsigned long lastWakeTime = 0;
  
@@ -565,7 +559,7 @@ void checkLowPowerMode(float magnitude) {
   }
 }
 
-// --- INICIALIZACIÓN DEL FILTRO DE ORIENTACIÓN ---
+// --- INICIALIZACIÓN DEL FILTRO DE ORIENTACIÓN --- ✅
 void inicializarFiltroOrientacion() {
   Serial.println("[Filtro] Inicializando orientacion...");
  
@@ -594,7 +588,7 @@ void inicializarFiltroOrientacion() {
   Serial.println("[Filtro] Orientacion inicial estabilizada.");
 }
 
-// --- FILTRO DE MADGWICK ---
+// --- FILTRO DE MADGWICK --- ✅
 void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz, float dt) {
   float recipNorm;
   float s0, s1, s2, s3;
@@ -658,7 +652,7 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
   q3 *= recipNorm;
 }
 
-// --- FILTRO DE CAÍDAS ---
+// --- FILTRO DE CAÍDAS --- ✅
 void filtroCaidas(float mag, float inclination) {
   bool currentFallState = false;
   unsigned long now = millis();
@@ -678,9 +672,13 @@ void filtroCaidas(float mag, float inclination) {
   }
 
   if (currentFallState) {
+
     if (now - g_data.fallTimestamp > FALL_INACTIVITY_TIME) {
+
       if (mag > 0.8 && mag < 1.2) {
+
         if (abs(inclination) > FALL_ANGLE_THRESHOLD) {
+
           if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
             strcpy(g_data.estadoGlobal, "CAIDA CONFIRMADA");
             xSemaphoreGive(dataMutex);
@@ -692,6 +690,7 @@ void filtroCaidas(float mag, float inclination) {
             xSemaphoreGive(dataMutex);
           }
         }
+
       } else {
         if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
           strcpy(g_data.estadoGlobal, "MOVIMIENTO");
@@ -699,11 +698,13 @@ void filtroCaidas(float mag, float inclination) {
           xSemaphoreGive(dataMutex);
         }
       }
+
     } else {
       if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
         strcpy(g_data.estadoGlobal, "ANALIZANDO...");
         xSemaphoreGive(dataMutex);
       }
+
     }
   } else {
     if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
@@ -720,7 +721,7 @@ void filtroCaidas(float mag, float inclination) {
   }
 }
 
-// --- ACTUALIZACIÓN DE PANTALLA OLED (con barra de calidad) ---
+// --- ACTUALIZACIÓN DE PANTALLA OLED (con barra de calidad) --- ✅
 void actualizarOLED() {
   if (!oled_present) return;
 
@@ -818,7 +819,7 @@ void enviarTelemetria() {
   Serial.printf("Tamaño paquete: %d bytes\n", sizeof(packet));
 }
 
-// --- REINICIO DEL BUS I2C ---
+// --- REINICIO DEL BUS I2C --- ✅
 void resetI2CBus() {
   Serial.println("[WATCHDOG] Reiniciando bus I2C...");
   Wire.end();
@@ -827,7 +828,7 @@ void resetI2CBus() {
   Wire.setClock(100000);
 }
 
-// --- VERIFICACIÓN DEL WATCHDOG ---
+// --- VERIFICACIÓN DEL WATCHDOG --- ✅
 void checkWatchdog() {
   unsigned long now = millis();
 
