@@ -1,11 +1,10 @@
 //
 // ********************************************************************
-// *                                                                  *
-// *  ALMA - Asistente Logístico de Monitoreo Avanzado (v1000%)       *
-// *                                                                  *
-// *  Nivel Élite - WRO 2026                                         *
-// *                                                                  *
-// *  Características:                                                *
+// *                                                                 *
+// *  ALMA - Asistente Logístico de Monitoreo Avanzado               *
+// *                                                                 *                                         *
+// *                                                                 *
+// *  Características:                                               *
 // *  - Multi-tarea optimizada (Core 0: Biometría / Core 1: Mov.)    *
 // *  - Filtro Madgwick para orientación absoluta                    *
 // *  - Detección de caídas con confirmación por ángulo              *
@@ -14,10 +13,10 @@
 // *  - Modo Low Power con wake-on-motion                            *
 // *  - Watchdog por software con reinicio I2C                       *
 // *  - Estructura binaria para telemetría LoRa/BLE                  *
-// *  - Barra de calidad de señal en OLED                            *bi
+// *  - Barra de calidad de señal en OLED                            *
 // *  - Calibración dinámica de orientación                          *
-// *                                                                  *
-// ********************************************************************
+// *                                                                 *
+// *******************************************************************
 //
 
 #include <Wire.h>
@@ -31,12 +30,98 @@
 #include <Adafruit_BMP280.h>
 // MPU
 #include "MPU9250.h"
+// Web Server
+#include <WiFi.h>
+#include <WebServer.h>
+// Comunication
+#include <esp_now.h>
+
+typedef struct __attribute__((packed)) {
+  uint32_t timestamp;
+  int32_t heartRate;
+  int32_t spo2;
+  float temperature;
+  float humidity;
+  float pressure;
+  float roll;
+  float pitch;
+  float yaw;
+  float magnitude;
+  char estadoGlobal[20];
+  uint8_t fallDetected;
+  uint8_t signalQuality;
+} TelemetryPacket;
+
+uint8_t receiverAddress[] = {0x68, 0x25, 0xDD, 0x2F, 0xCA, 0x9C};
+esp_now_peer_info_t peerInfo;
 
 // --- Configuración de Pantalla OLED ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define OLED_ADDRESS 0x3C
+
+// --- Configuración Servidor Web ---
+const char* ssid = "ALMA_DASHBOARD";
+const char* password = ""; // Sin contraseña para acceso rápido en competencia, modifícalo si quieres
+WebServer server(80);
+
+// --- Interfaz Web (HTML + CSS + JS) alojada en PROGMEM ---
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ALMA Telemetría</title>
+  <style>
+    body { font-family: 'Courier New', Courier, monospace; background-color: #0a0a0a; color: #00ffcc; text-align: center; margin: 0; padding: 20px; }
+    h2 { color: #ffffff; border-bottom: 1px solid #333; padding-bottom: 10px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; max-width: 800px; margin: 20px auto; }
+    .card { background: #1a1a1a; border: 1px solid #333; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,255,204,0.1); }
+    .value { font-size: 1.8em; font-weight: bold; margin-top: 10px; }
+    .status-alert { color: #ff3333; animation: blinker 1s linear infinite; }
+    @keyframes blinker { 50% { opacity: 0; } }
+  </style>
+</head>
+<body>
+  <h2>[ ALMA - Asistente Logístico de Monitoreo Avanzado ] Dashboard en Vivo</h2>
+  <div class="card" style="max-width: 800px; margin: 0 auto; margin-bottom: 15px;">
+    <div>Estado Global: <span id="estado" class="value" style="color: #fff;">ESPERANDO DATOS</span></div>
+  </div>
+  <div class="grid">
+    <div class="card"><div>BPM</div><div id="hr" class="value">--</div></div>
+    <div class="card"><div>SpO2 (%)</div><div id="spo2" class="value">--</div></div>
+    <div class="card"><div>Temp (°C)</div><div id="temp" class="value">--</div></div>
+    <div class="card"><div>Pitch (°)</div><div id="pitch" class="value">--</div></div>
+    <div class="card"><div>Mag (G)</div><div id="mag" class="value">--</div></div>
+    <div class="card"><div>Señal PPG</div><div id="signal" class="value">--</div></div>
+  </div>
+<script>
+setInterval(function() {
+  fetch('/data').then(response => response.json()).then(data => {
+    document.getElementById("hr").innerText = data.hr;
+    document.getElementById("spo2").innerText = data.spo2;
+    document.getElementById("temp").innerText = data.temp.toFixed(2);
+    document.getElementById("pitch").innerText = data.pitch.toFixed(1);
+    document.getElementById("mag").innerText = data.mag.toFixed(2);
+    
+    let estadoEl = document.getElementById("estado");
+    estadoEl.innerText = data.estado;
+    if(data.fall == 1) {
+        estadoEl.className = "value status-alert";
+    } else {
+        estadoEl.className = "value";
+        estadoEl.style.color = "#00ffcc";
+    }
+    
+    document.getElementById("signal").innerText = data.signal ? "ÓPTIMA" : "DÉBIL";
+    document.getElementById("signal").style.color = data.signal ? "#00ffcc" : "#ff9900";
+  }).catch(err => console.log(err));
+}, 250); // Fetch cada 250ms (4Hz) para fluidez sin saturar el bus
+</script>
+</body>
+</html>
+)rawliteral";
 
 // --- Configuración de Pines I2C para ESP32 (General) ---
 #define I2C_SDA 21
@@ -142,6 +227,47 @@ void calibrarNivel();
 bool sanityCheckHR(int32_t newHR);
 bool sanityCheckSpO2(int32_t newSpO2);
 void checkLowPowerMode(float magnitude);
+
+// --- Manejadores del Servidor Web ---
+void handleRoot() {
+  server.send_P(200, "text/html", index_html);
+}
+
+void handleData() {
+  SensorData localData;
+  // Copia segura de datos, idéntico a tu lógica de telemetría actual
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
+    xSemaphoreGive(dataMutex);
+  } else {
+    server.send(503, "application/json", "{\"error\":\"Mutex timeout\"}");
+    return;
+  }
+
+  // Construcción manual de JSON para evitar librerías pesadas
+  String json = "{";
+  json += "\"hr\":" + String(localData.heartRate) + ",";
+  json += "\"spo2\":" + String(localData.spo2) + ",";
+  json += "\"temp\":" + String(localData.temperature) + ",";
+  json += "\"pitch\":" + String(localData.pitch) + ",";
+  json += "\"mag\":" + String(localData.magnitude) + ",";
+  json += "\"fall\":" + String(localData.fallDetected ? 1 : 0) + ",";
+  json += "\"signal\":" + String(localData.signalQuality ? 1 : 0) + ",";
+  json += "\"estado\":\"" + String(localData.estadoGlobal) + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// --- TAREA AISLADA PARA EL SERVIDOR WEB (CORE 0) ---
+void WebServerTask(void *pvParameters) {
+  Serial.println("[WebServer] Tarea iniciada en Core 0");
+  for (;;) {
+    server.handleClient();
+    enviarTelemetria();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
 
 // ******************************
 // * TAREA CORE 0: BIOMETRÍA    * ✅ (Versión Corregida v1000%)
@@ -321,6 +447,46 @@ void setup() {
   }
 
   lastMotionTime = millis();
+
+  // --- INICIO CÓDIGO NUEVO: WEB SERVER ---
+  Serial.println("[Red] Configurando Access Point...");
+  // FORZAMOS EL CANAL 1 PARA EVITAR PÉRDIDA DE PAQUETES CON ESP-NOW
+  WiFi.softAP(ssid, password, 1); 
+  IPAddress IP = WiFi.softAPIP();
+  
+  // Inicializar ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ERROR] Error inicializando ESP-NOW");
+    return;
+  }
+  
+  // Registrar el receptor
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
+  peerInfo.channel = 1;  
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("[ERROR] Fallo al añadir el peer ESP-NOW");
+    return;
+  }
+  
+  Serial.print("[Red] AP Iniciado. IP para conectar: ");
+  Serial.println(IP); // Usualmente es 192.168.4.1
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.begin();
+
+  // Crear Tarea del Servidor en el Núcleo 0 (Prioridad 0, más baja que Biometría)
+  xTaskCreatePinnedToCore(
+    WebServerTask,
+    "WebServerTask",
+    4096,
+    NULL,
+    0, // Prioridad 0
+    NULL,
+    0  // Core 0
+  );
 
   // --- Crear Tarea en el Núcleo 0 ---
   xTaskCreatePinnedToCore(
@@ -848,48 +1014,53 @@ void actualizarOLED() {
 // --- ENVÍO DE TELEMETRÍA ---
 void enviarTelemetria() {
   SensorData localData;
+  
+  // Bloqueo de exclusión mutua para copia atómica de datos
   if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
     memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
   }
 
-  typedef struct __attribute__((packed)) {
-    uint32_t timestamp;
-    int32_t heartRate;
-    int32_t spo2;
-    float temperature;
-    float humidity;
-    float pressure;
-    float roll;
-    float pitch;
-    float yaw;
-    float magnitude;
-    char estadoGlobal[20];
-    uint8_t fallDetected;
-    uint8_t signalQuality;
-  } TelemetryPacket;
-
   TelemetryPacket packet;
+  
+  // 1. Metadatos y Biometría
   packet.timestamp = millis();
   packet.heartRate = localData.heartRate;
   packet.spo2 = localData.spo2;
+
+  // 2. Entorno (BME280)
   packet.temperature = localData.temperature;
   packet.pressure = localData.pressure;
+
+  // 3. Orientación y Movimiento (BNO055 + Madgwick)
   packet.roll = localData.roll;
   packet.pitch = localData.pitch;
   packet.yaw = localData.yaw;
   packet.magnitude = localData.magnitude;
+
+  // 4. Estado Logístico (Manejo seguro de strings)
+  // Copiamos el string limitando el tamaño para no desbordar el struct
   strncpy(packet.estadoGlobal, localData.estadoGlobal, sizeof(packet.estadoGlobal) - 1);
-  packet.estadoGlobal[sizeof(packet.estadoGlobal) - 1] = '\0';
+  packet.estadoGlobal[sizeof(packet.estadoGlobal) - 1] = '\0'; // Asegurar terminación nula
+
+  // 5. Flags de estado
   packet.fallDetected = localData.fallDetected ? 1 : 0;
   packet.signalQuality = localData.signalQuality ? 1 : 0;
 
-  // Envío por Serial para depuración
-  Serial.println("--- Paquete Telemetría ---");
-  Serial.printf("HR:%ld SpO2:%ld T:%.2f .2f P:%.2f\n", packet.heartRate, packet.spo2, packet.temperature, packet.pressure);
-  Serial.printf("Orientacion R:%.2f P:%.2f Y:%.2f Mag:%.2f\n", packet.roll, packet.pitch, packet.yaw, packet.magnitude);
-  Serial.printf("Estado:%s Fall:%d SQ:%d\n", packet.estadoGlobal, packet.fallDetected, packet.signalQuality);
-  Serial.printf("Tamaño paquete: %d bytes\n", sizeof(packet));
+  if (packet.heartRate > 0 || packet.fallDetected) {
+    esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
+  }
+
+  // Enviar vía ESP-NOW (Casting a puntero de bytes para transmisión binaria)
+  esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
+   
+  if (result == ESP_OK) {
+    Serial.printf("[ESP-NOW] Envío exitoso (%d bytes) | HR: %ld | Est: %s\n", 
+                  sizeof(packet), packet.heartRate, packet.estadoGlobal);
+  } else {
+    Serial.print("[ERROR] Fallo en el envío ESP-NOW. Código: ");
+    Serial.println(result);
+  }
 }
 
 // --- REINICIO DEL BUS I2C --- ✅
