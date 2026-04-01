@@ -14,7 +14,7 @@
 // *  - Modo Low Power con wake-on-motion                            *
 // *  - Watchdog por software con reinicio I2C                       *
 // *  - Estructura binaria para telemetría LoRa/BLE                  *
-// *  - Barra de calidad de señal en OLED                            *
+// *  - Barra de calidad de señal en OLED                            *bi
 // *  - Calibración dinámica de orientación                          *
 // *                                                                  *
 // ********************************************************************
@@ -28,7 +28,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 // BME280
-#include <Adafruit_BME280.h>
+#include <Adafruit_BMP280.h>
 // MPU
 #include "MPU9250.h"
 
@@ -69,7 +69,7 @@ MAX30105 particleSensor;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 MPU9250 mpu;
-Adafruit_BME280 bme;
+Adafruit_BMP280 bme;
 
 // --- Variables de Estado de Sensores (para modo seguro) ---
 bool bme_present = false;
@@ -88,7 +88,7 @@ typedef struct {
   // Biométricos
   int32_t heartRate;
   int32_t spo2;
-  float humidity;
+  float temperature;
   float pressure;
   // Movimiento
   float ax, ay, az;
@@ -109,6 +109,7 @@ SensorData g_data;
 // --- Buffers y Filtros para MAX30102 ---
 uint32_t irBuffer[MAX30102_SAMPLES];
 uint32_t redBuffer[MAX30102_SAMPLES];
+uint32_t samplesCollected = 0;
 int32_t spo2_buffer[SPO2_SIZE];
 int32_t hr_buffer[RATE_SIZE];
 uint8_t spo2_buffer_index = 0;
@@ -117,7 +118,8 @@ uint8_t hr_buffer_index = 0;
 // --- MEJORA ELITE: Filtro de outliers (sanity check) ---
 int32_t lastValidHR = 70;       // Valor inicial típico
 int32_t lastValidSpO2 = 97;     // Valor inicial típico
-const float MAX_HR_CHANGE = 0.10; // 10% de cambio máximo permitido
+const float MAX_HR_CHANGE = 0.25; // 10% de cambio máximo permitido
+const int MAX_REJECTION_COUNT = 3;     // Reducimos de 5 a 3 para converger más rápido
 
 // --- Variables para el Filtro Madgwick (Orientación) ---
 float beta = 0.1f;  // Ganancia del filtro Madgwick
@@ -139,56 +141,37 @@ void inicializarFiltroOrientacion();
 void calibrarNivel();
 bool sanityCheckHR(int32_t newHR);
 bool sanityCheckSpO2(int32_t newSpO2);
-void checkLowPowerMode(float magnitude); 
+void checkLowPowerMode(float magnitude);
 
 // ******************************
-// * TAREA CORE 0: BIOMETRÍA   * ✅
+// * TAREA CORE 0: BIOMETRÍA    * ✅ (Versión Corregida v1000%)
 // ******************************
 void BiometricTask(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(20); // ~50Hz de muestreo para el MAX30102
+  const TickType_t xFrequency = pdMS_TO_TICKS(20);
 
-  // Variables para el algoritmo SpO2
   int32_t spo2, hr;
   int8_t validSPO2, validHR;
-  uint8_t samplesCollected = 0;
   uint32_t signalQualitySum = 0;
 
-  Serial.println("[Tarea0] Biometría iniciada.");
+  Serial.println("[Tarea0] Biometría optimizada y simplificada iniciada.");
 
   for (;;) {
-    // --- 1. RESET DEL WATCHDOG ---
     lastTaskReset[0] = millis();
 
-    // --- 2. VERIFICAR MODO LOW POWER ---
     if (lowPowerMode) {
-      // En low power, muestreamos menos frecuente
-      vTaskDelay(pdMS_TO_TICKS(100)); // Reducir frecuencia a 10Hz
-     
-      // Intentar leer pero sin forzar
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (max_present) {
-          particleSensor.check();
-        }
-        xSemaphoreGive(i2cMutex);
-      }
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
-    // --- 3. LLENADO DEL BUFFER CIRCULAR (Modo normal) ---
+    // --- 1. LLENADO SEGURO DEL BUFFER ---
     if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       if (max_present) {
         particleSensor.check();
-
         while (particleSensor.available() && samplesCollected < MAX30102_SAMPLES) {
           redBuffer[samplesCollected] = particleSensor.getRed();
           irBuffer[samplesCollected] = particleSensor.getIR();
-         
-          // Acumular para calcular calidad de señal
-          if (samplesCollected > 0) {
-            signalQualitySum += irBuffer[samplesCollected];
-          }
-         
+          signalQualitySum += irBuffer[samplesCollected];
           particleSensor.nextSample();
           samplesCollected++;
         }
@@ -196,72 +179,64 @@ void BiometricTask(void *pvParameters) {
       xSemaphoreGive(i2cMutex);
     }
 
-    // --- 4. PROCESAMIENTO DEL ALGORITMO ---
+    // --- 2. PROCESAMIENTO CUANDO EL BUFFER ESTÁ LLENO ---
     if (samplesCollected >= MAX30102_SAMPLES) {
-      // Calcular calidad de señal (MEJORA ELITE: barra de confianza)
       float avgSignal = signalQualitySum / MAX30102_SAMPLES;
       bool goodSignal = (avgSignal > SIGNAL_QUALITY_THRESHOLD);
-     
+
+      // Actualizar calidad de señal (esto controla la barra de la OLED)
       if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
         g_data.signalQuality = goodSignal;
         xSemaphoreGive(dataMutex);
       }
 
       if (goodSignal) {
+        // Ejecutar algoritmo de Maxim
         maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX30102_SAMPLES, redBuffer, &spo2, &validSPO2, &hr, &validHR);
 
-        // MEJORA ELITE: Sanity check para BPM
-        if (validHR && hr > 20 && hr < 220) {
-          if (sanityCheckHR(hr)) {
-            hr_buffer[hr_buffer_index] = hr;
-            hr_buffer_index = (hr_buffer_index + 1) % RATE_SIZE;
-            int32_t hr_sum = 0;
-            for (int i = 0; i < RATE_SIZE; i++) hr_sum += hr_buffer[i];
-            int32_t filteredHR = hr_sum / RATE_SIZE;
-           
-            if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-              g_data.heartRate = filteredHR;
-              lastValidHR = filteredHR;
-              xSemaphoreGive(dataMutex);
-            }
+        // Actualizar datos de forma segura si son lógicos
+        if (validHR && sanityCheckHR(hr)) {
+          if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            g_data.heartRate = hr; // Simplificado: quitamos el array de media móvil que añadía latencia
+            lastValidHR = hr;
+            xSemaphoreGive(dataMutex);
           }
         }
 
-        // MEJORA ELITE: Sanity check para SpO2
-        if (validSPO2 && spo2 > 70 && spo2 < 100) {
-          if (sanityCheckSpO2(spo2)) {
-            spo2_buffer[spo2_buffer_index] = spo2;
-            spo2_buffer_index = (spo2_buffer_index + 1) % SPO2_SIZE;
-            int32_t spo2_sum = 0;
-            for (int i = 0; i < SPO2_SIZE; i++) spo2_sum += spo2_buffer[i];
-            int32_t filteredSpO2 = spo2_sum / SPO2_SIZE;
-           
-            if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-              g_data.spo2 = filteredSpO2;
-              lastValidSpO2 = filteredSpO2;
-              xSemaphoreGive(dataMutex);
-            }
+        if (validSPO2 && sanityCheckSpO2(spo2)) {
+          if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            g_data.spo2 = spo2; // Simplificado
+            lastValidSpO2 = spo2;
+            xSemaphoreGive(dataMutex);
           }
         }
+      } else {
+        // Si no hay dedo, NO reseteamos los BPM a 0 de inmediato.
+        // Dejamos que la OLED muestre el último dato, pero g_data.signalQuality = false
+        // alertará visualmente que la lectura actual no es fiable.
+        Serial.println("[Biometria] Baja calidad de señal. Manteniendo último valor conocido.");
       }
 
-      samplesCollected = 0;
-      signalQualitySum = 0;
+      // --- DESPLAZAMIENTO DE VENTANA (Sliding Window) ---
+      // Desplazamos 25 muestras para sobreescribirlas en el siguiente ciclo
+      for (byte i = 25; i < 100; i++) {
+        redBuffer[i - 25] = redBuffer[i];
+        irBuffer[i - 25] = irBuffer[i];
+      }
+      samplesCollected = 75;
     }
 
-    // --- 5. LECTURA DE SENSORES AMBIENTALES ---
+    // --- 3. LECTURA AMBIENTAL ESPORÁDICA ---
     static unsigned long lastEnvRead = 0;
-    if (millis() - lastEnvRead > 1000 && !lowPowerMode) {
+    if (millis() - lastEnvRead > 1000) {
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         if (bme_present) {
-          float newHum = bme.readHumidity();
-          float newPres = bme.readPressure() / 100.0F;
-          if (!isnan(newHum) && !isnan(newPres)) {
-            if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-              g_data.humidity = newHum;
-              g_data.pressure = newPres;
-              xSemaphoreGive(dataMutex);
-            }
+          float nt = bme.readTemperature();
+          float np = bme.readPressure() / 100.0F;
+          if (!isnan(nt) && xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            g_data.temperature = nt;
+            g_data.pressure = np;
+            xSemaphoreGive(dataMutex);
           }
         }
         xSemaphoreGive(i2cMutex);
@@ -358,6 +333,9 @@ void setup() {
     0
   );
 
+  lastTaskReset[0] = millis();
+  lastTaskReset[1] = millis();
+
   Serial.println("[SETUP] Listo. Entrando en loop principal.");
 }
 
@@ -372,10 +350,11 @@ void loop() {
   static unsigned long lastMPURead = 0;
   unsigned long currentMicros = micros();
   float dt = 0.01f; // Valor por defecto seguro
- 
+
   bool lecturaExitosa = false;
 
   if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+
     if (mpu_present && mpu.update()) {
       float ax = mpu.getAccX();
       float ay = mpu.getAccY();
@@ -398,10 +377,14 @@ void loop() {
       aplicarFiltroMadgwick(ax, ay, az, gx, gy, gz, mx, my, mz, dt);
 
       // Calcular magnitud y aplicar offset de calibración
-      float mag = sqrt(ax*ax + ay*ay + az*az);
-      float pitch = (asin(2.0f*(q0*q2 - q3*q1)) * 180.0f / PI) - pitchOffset;
-      float roll = (atan2(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2)) * 180.0f / PI) - rollOffset;
-      float yaw = atan2(2.0f*(q0*q3 + q1*q2), 1.0f - 2.0f*(q2*q2 + q3*q3)) * 180.0f / PI;
+      float asinInput = 2.0f * (q0 * q2 - q3 * q1);
+      if (asinInput > 1.0f) asinInput = 1.0f;
+      if (asinInput < -1.0f) asinInput = -1.0f;
+
+      float mag = sqrt(ax * ax + ay * ay + az * az);
+      float pitch = (asin(asinInput) * 180.0f / PI) - pitchOffset;
+      float roll = (atan2(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * 180.0f / PI) - rollOffset;
+      float yaw = atan2(2.0f * (q0 * q3 + q1 * q2), 1.0f - 2.0f * (q2 * q2 + q3 * q3)) * 180.0f / PI;
 
       checkLowPowerMode(mag);
 
@@ -437,7 +420,7 @@ void loop() {
     memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
   }
- 
+
   if (!lowPowerMode) {
     filtroCaidas(localData.magnitude, localData.pitch);
   }
@@ -480,11 +463,11 @@ void loop() {
 void calibrarNivel() {
   Serial.println("[Calibracion] Estableciendo nivel cero...");
   delay(500); // Esperar a que el sensor se estabilice
- 
+
   float sumPitch = 0;
   float sumRoll = 0;
   int samples = 50;
- 
+
   for (int i = 0; i < samples; i++) {
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
       if (mpu.update()) {
@@ -497,49 +480,103 @@ void calibrarNivel() {
         float mx = mpu.getMagX();
         float my = mpu.getMagY();
         float mz = mpu.getMagZ();
-       
+
         aplicarFiltroMadgwick(ax, ay, az, gx, gy, gz, mx, my, mz, 0.01f);
-       
-        sumPitch += asin(2.0f*(q0*q2 - q3*q1)) * 180.0f / PI;
-        sumRoll += atan2(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2)) * 180.0f / PI;
+
+        sumPitch += asin(2.0f * (q0 * q2 - q3 * q1)) * 180.0f / PI;
+        sumRoll += atan2(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * 180.0f / PI;
       }
       xSemaphoreGive(i2cMutex);
     }
     delay(10);
   }
- 
+
   pitchOffset = sumPitch / samples;
   rollOffset = sumRoll / samples;
- 
+
   Serial.printf("[Calibracion] Offset - Pitch: %.2f, Roll: %.2f\n", pitchOffset, rollOffset);
-} 
+}
 
 // Sanity Check para HR --- ✅
+#define SIGNAL_QUALITY_THRESHOLD 20000
+
+// --- FUNCIÓN DE VALIDACIÓN CORREGIDA ---
 bool sanityCheckHR(int32_t newHR) {
-  if (lastValidHR == 0) return true; // Primera lectura
- 
+  // Límite fisiológico absoluto
+  if (newHR < 40 || newHR > 200) return false;
+
+  // Enganche inicial
+  if (g_data.heartRate == 0) {
+    lastValidHR = newHR;
+    return true;
+  }
+
+  // Evaluar fluctuación
   float change = abs(newHR - lastValidHR) / (float)lastValidHR;
-  return (change <= MAX_HR_CHANGE);
+  if (change <= 0.40) {
+    return true;
+  }
+
+  // Mecanismo de recuperación (evita que el filtro rechace un cambio real permanente)
+  static int failedAttemptsHR = 0;
+  failedAttemptsHR++;
+
+  if (failedAttemptsHR > 3) {
+    lastValidHR = newHR;
+    failedAttemptsHR = 0;
+    return true;
+  }
+
+  return false;
 }
 // Sanity Check para SpO2 --- ✅
+const float MAX_SPO2_CHANGE = 0.10; // 5% de cambio máximo permitido (mucho más estricto que HR)
+
 bool sanityCheckSpO2(int32_t newSpO2) {
-  if (lastValidSpO2 == 0) return true;
- 
+  // 1. Límite fisiológico duro: Valores bajo 80% son ruido o el sensor está suelto. >100% es físicamente imposible.
+  if (newSpO2 < 85 || newSpO2 > 100) {
+    return false;
+  }
+
+  // 2. Enganche inicial seguro (asumiendo que 97 era tu valor por defecto en las variables globales)
+  if (lastValidSpO2 == 0 || lastValidSpO2 == 97) {
+    lastValidSpO2 = newSpO2;
+    return true;
+  }
+
+  // 3. Evaluar la fluctuación porcentual
   float change = abs(newSpO2 - lastValidSpO2) / (float)lastValidSpO2;
-  return (change <= MAX_HR_CHANGE); // Mismo umbral
+
+  if (change <= MAX_SPO2_CHANGE) {
+    return true;
+  } else {
+    // 4. Mecanismo de recuperación (Soft Reset)
+    // Si el SpO2 realmente cayó drásticamente (ej. un evento médico real)
+    // y se mantiene ahí, debemos permitir que el algoritmo acepte la nueva realidad
+    // después de unos cuantos ciclos de confirmación.
+    static int failedAttemptsSpO2 = 0;
+    failedAttemptsSpO2++;
+
+    if (failedAttemptsSpO2 > 5) { // Tras 5 lecturas anómalas consecutivas, aceptamos el nuevo valor
+      lastValidSpO2 = newSpO2;
+      failedAttemptsSpO2 = 0;
+      return true;
+    }
+    return false;
+  }
 }
 
 // --- Low Power Mode --- ✅
 void checkLowPowerMode(float magnitude) {
   static unsigned long lastWakeTime = 0;
- 
+
   // Detectar movimiento
   if (magnitude < (1.0f + MOTION_THRESHOLD) && magnitude > (1.0f - MOTION_THRESHOLD)) {
     // En reposo (cerca de 1G)
     if (millis() - lastMotionTime > INACTIVITY_TIMEOUT && !lowPowerMode) {
       lowPowerMode = true;
       Serial.println("[LowPower] Modo ahorro activado - Sin movimiento detectado");
-     
+
       if (oled_present) {
         display.ssd1306_command(SSD1306_DISPLAYOFF);
       }
@@ -547,11 +584,11 @@ void checkLowPowerMode(float magnitude) {
   } else {
     // Hay movimiento
     lastMotionTime = millis();
-   
+
     if (lowPowerMode) {
       lowPowerMode = false;
       Serial.println("[LowPower] Despertando por movimiento");
-     
+
       if (oled_present) {
         display.ssd1306_command(SSD1306_DISPLAYON);
       }
@@ -562,9 +599,9 @@ void checkLowPowerMode(float magnitude) {
 // --- INICIALIZACIÓN DEL FILTRO DE ORIENTACIÓN --- ✅
 void inicializarFiltroOrientacion() {
   Serial.println("[Filtro] Inicializando orientacion...");
- 
+
   q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
- 
+
   for (int i = 0; i < 100; i++) {
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
       if (mpu.update()) {
@@ -577,45 +614,78 @@ void inicializarFiltroOrientacion() {
         float mx = mpu.getMagX();
         float my = mpu.getMagY();
         float mz = mpu.getMagZ();
-       
+
         aplicarFiltroMadgwick(ax, ay, az, gx, gy, gz, mx, my, mz, 0.01f);
       }
       xSemaphoreGive(i2cMutex);
     }
     delay(10);
   }
- 
+
   Serial.println("[Filtro] Orientacion inicial estabilizada.");
 }
 
 // --- FILTRO DE MADGWICK --- ✅
 void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz, float dt) {
+  if (isnan(ax) || isnan(ay) || isnan(az) || isnan(gx) || isnan(gy) || isnan(gz)) return;
+
+  // --- PROTECCIÓN 2: Fallback si el magnetómetro está muerto (0,0,0) ---
+  float magNorm = sqrt(mx * mx + my * my + mz * mz);
+  if (magNorm < 0.001f) {
+    // Si no hay magnetómetro, usamos una versión simplificada de 6 ejes
+    // o simplemente ignoramos el aporte del magnetómetro en el gradiente.
+    mx = 0; my = 0; mz = 0;
+  }
+
   float recipNorm;
   float s0, s1, s2, s3;
   float qDot1, qDot2, qDot3, qDot4;
   float hx, hy;
-  float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1, _2q2, _2q3, _2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+  float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1, _2q2, _2q3, _2q0q2, _2q2q3;
 
+  // --- PASO CRÍTICO: Inicializar productos de cuaterniones ---
+  float q0q0 = q0 * q0;
+  float q0q1 = q0 * q1;
+  float q0q2 = q0 * q2;
+  float q0q3 = q0 * q3;
+  float q1q1 = q1 * q1;
+  float q1q2 = q1 * q2;
+  float q1q3 = q1 * q3;
+  float q2q2 = q2 * q2;
+  float q2q3 = q2 * q3;
+  float q3q3 = q3 * q3;
+
+  // Velocidad de cambio del cuaternión
   qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
   qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
   qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
   qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
 
-  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-    recipNorm = 1.0f / sqrt(ax * ax + ay * ay + az * az);
-    ax *= recipNorm;
-    ay *= recipNorm;
-    az *= recipNorm;
+  // Solo procesar si el acelerómetro tiene datos (evitar división por cero)
+  float accNorm = sqrt(ax * ax + ay * ay + az * az);
+  if (accNorm > 0.0f) {
+    recipNorm = 1.0f / accNorm;
+    ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
 
-    recipNorm = 1.0f / sqrt(mx * mx + my * my + mz * mz);
-    mx *= recipNorm;
-    my *= recipNorm;
-    mz *= recipNorm;
+    // Normalizar magnetómetro
+    float magNorm = sqrt(mx * mx + my * my + mz * mz);
+    if (magNorm > 0.0f) {
+      recipNorm = 1.0f / magNorm;
+      mx *= recipNorm; my *= recipNorm; mz *= recipNorm;
+    }
 
+    // Cálculos auxiliares para optimizar
     _2q0mx = 2.0f * q0 * mx;
     _2q0my = 2.0f * q0 * my;
     _2q0mz = 2.0f * q0 * mz;
     _2q1mx = 2.0f * q1 * mx;
+    _2q0 = 2.0f * q0;
+    _2q1 = 2.0f * q1;
+    _2q2 = 2.0f * q2;
+    _2q3 = 2.0f * q3;
+    _2q0q2 = 2.0f * q0 * q2;
+    _2q2q3 = 2.0f * q2 * q3;
+
     hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2 + _2q1 * mz * q3 - mx * q2q2 - mx * q3q3;
     hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1 + my * q2q2 + _2q2 * mz * q3 - my * q3q3;
     _2bx = sqrt(hx * hx + hy * hy);
@@ -623,35 +693,42 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
     _4bx = 2.0f * _2bx;
     _4bz = 2.0f * _2bz;
 
+    // Gradiente descendente
     s0 = -_2q2 * (2.0f * q1q3 - _2q0q2 - ax) + _2q1 * (2.0f * q0q1 + _2q2q3 - ay) - _2bz * q2 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) + _2q0 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q1 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) + _2q3 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q2 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) + _2q0 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q1 * (1.0f - 2.0f * q1q1 - 2.0f * q2q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) + _2q3 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q2 * (1.0f - 2.0f * q1q1 - 2.0f * q2q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
     s3 = _2q1 * (2.0f * q1q3 - _2q0q2 - ax) + _2q2 * (2.0f * q0q1 + _2q2q3 - ay) + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
 
-    recipNorm = 1.0f / sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
-    s0 *= recipNorm;
-    s1 *= recipNorm;
-    s2 *= recipNorm;
-    s3 *= recipNorm;
-
-    qDot1 -= beta * s0;
-    qDot2 -= beta * s1;
-    qDot3 -= beta * s2;
-    qDot4 -= beta * s3;
+    // Normalizar paso del gradiente
+    float sNorm = sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+    if (sNorm > 0.0f) {
+      recipNorm = 1.0f / sNorm;
+      s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+      qDot1 -= beta * s0;
+      qDot2 -= beta * s1;
+      qDot3 -= beta * s2;
+      qDot4 -= beta * s3;
+    }
   }
 
+  // Integrar para hallar el nuevo cuaternión
   q0 += qDot1 * dt;
   q1 += qDot2 * dt;
   q2 += qDot3 * dt;
   q3 += qDot4 * dt;
 
-  recipNorm = 1.0f / sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  q0 *= recipNorm;
-  q1 *= recipNorm;
-  q2 *= recipNorm;
-  q3 *= recipNorm;
-}
+  // Normalizar cuaternión final
+  float qNorm = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  if (isnan(qNorm) || qNorm < 0.0001f) {
+    // Si colapsa, resetear a la posición identidad
+    q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
+    return;
+  }
 
+  // Normalización final (ya la tienes, pero asegúrate que use recipNorm con chequeo)
+  recipNorm = 1.0f / qNorm;
+  q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
+}
 // --- FILTRO DE CAÍDAS --- ✅
 void filtroCaidas(float mag, float inclination) {
   bool currentFallState = false;
@@ -736,9 +813,6 @@ void actualizarOLED() {
 
   // Título
   display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("ALMA WRO 2026");
-  display.drawLine(0, 10, 128, 10, WHITE);
 
   // Fila 1: BPM y SpO2
   display.setCursor(0, 12);
@@ -754,7 +828,7 @@ void actualizarOLED() {
 
   // Fila 2: Temperatura y Humedad
   display.setCursor(0, 24);
-  sprintf(buffer, "T:%.1fC H:%.0f%%", localData.temperature, localData.humidity);
+  sprintf(buffer, "T:%.2f", localData.temperature);
   display.print(buffer);
 
   // Fila 3: Presión
@@ -800,7 +874,6 @@ void enviarTelemetria() {
   packet.heartRate = localData.heartRate;
   packet.spo2 = localData.spo2;
   packet.temperature = localData.temperature;
-  packet.humidity = localData.humidity;
   packet.pressure = localData.pressure;
   packet.roll = localData.roll;
   packet.pitch = localData.pitch;
@@ -813,7 +886,7 @@ void enviarTelemetria() {
 
   // Envío por Serial para depuración
   Serial.println("--- Paquete Telemetría ---");
-  Serial.printf("HR:%ld SpO2:%ld T:%.2f H:%.2f P:%.2f\n", packet.heartRate, packet.spo2, packet.temperature, packet.humidity, packet.pressure);
+  Serial.printf("HR:%ld SpO2:%ld T:%.2f .2f P:%.2f\n", packet.heartRate, packet.spo2, packet.temperature, packet.pressure);
   Serial.printf("Orientacion R:%.2f P:%.2f Y:%.2f Mag:%.2f\n", packet.roll, packet.pitch, packet.yaw, packet.magnitude);
   Serial.printf("Estado:%s Fall:%d SQ:%d\n", packet.estadoGlobal, packet.fallDetected, packet.signalQuality);
   Serial.printf("Tamaño paquete: %d bytes\n", sizeof(packet));
