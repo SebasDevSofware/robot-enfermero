@@ -459,11 +459,14 @@ void setup() {
     Serial.println("[ERROR] Error inicializando ESP-NOW");
     return;
   }
-  
+
+  peerInfo = {};
   // Registrar el receptor
   memcpy(peerInfo.peer_addr, receiverAddress, 6);
   peerInfo.channel = 1;  
   peerInfo.encrypt = false;
+
+  peerInfo.ifidx = WIFI_IF_AP;
   
   if (esp_now_add_peer(&peerInfo) != ESP_OK){
     Serial.println("[ERROR] Fallo al añadir el peer ESP-NOW");
@@ -1014,52 +1017,40 @@ void actualizarOLED() {
 // --- ENVÍO DE TELEMETRÍA ---
 void enviarTelemetria() {
   SensorData localData;
-  
-  // Bloqueo de exclusión mutua para copia atómica de datos
   if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
     memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
   }
 
   TelemetryPacket packet;
-  
-  // 1. Metadatos y Biometría
   packet.timestamp = millis();
   packet.heartRate = localData.heartRate;
   packet.spo2 = localData.spo2;
-
-  // 2. Entorno (BME280)
   packet.temperature = localData.temperature;
   packet.pressure = localData.pressure;
-
-  // 3. Orientación y Movimiento (BNO055 + Madgwick)
   packet.roll = localData.roll;
   packet.pitch = localData.pitch;
   packet.yaw = localData.yaw;
   packet.magnitude = localData.magnitude;
-
-  // 4. Estado Logístico (Manejo seguro de strings)
-  // Copiamos el string limitando el tamaño para no desbordar el struct
+  
   strncpy(packet.estadoGlobal, localData.estadoGlobal, sizeof(packet.estadoGlobal) - 1);
-  packet.estadoGlobal[sizeof(packet.estadoGlobal) - 1] = '\0'; // Asegurar terminación nula
-
-  // 5. Flags de estado
+  packet.estadoGlobal[sizeof(packet.estadoGlobal) - 1] = '\0';
+  
   packet.fallDetected = localData.fallDetected ? 1 : 0;
   packet.signalQuality = localData.signalQuality ? 1 : 0;
 
+  // Filtro analítico: Solo enviamos si hay datos válidos o una emergencia (caída)
   if (packet.heartRate > 0 || packet.fallDetected) {
-    esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
-  }
-
-  // Enviar vía ESP-NOW (Casting a puntero de bytes para transmisión binaria)
-  esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
-   
-  if (result == ESP_OK) {
-    Serial.printf("[ESP-NOW] Envío exitoso (%d bytes) | HR: %ld | Est: %s\n", 
-                  sizeof(packet), packet.heartRate, packet.estadoGlobal);
-  } else {
-    Serial.print("[ERROR] Fallo en el envío ESP-NOW. Código: ");
-    Serial.println(result);
+    
+    esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
+     
+    if (result == ESP_OK) {
+      Serial.printf("[ESP-NOW] Envío OK | HR: %ld | Est: %s\n", packet.heartRate, packet.estadoGlobal);
+    } else {
+      Serial.printf("[ERROR] Código: %d | MAC: ", result);
+      for(int i=0; i<6; i++) Serial.printf("%02X%s", receiverAddress[i], (i<5)?":":"");
+      Serial.println();
+    }
   }
 }
 

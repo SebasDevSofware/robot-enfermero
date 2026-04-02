@@ -44,6 +44,7 @@ void setup() {
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
+  delay(100);
   Serial.println("=========================================");
   Serial.print("MI MAC (Cópiala en el código de ALMA): ");
   Serial.println(WiFi.macAddress());
