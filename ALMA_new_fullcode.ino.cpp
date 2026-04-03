@@ -20,28 +20,22 @@
 //
 
 #include <Wire.h>
-// MAX30102 PPG Sensor
 #include "MAX30105.h"
 #include "spo2_algorithm.h"
-// OLED 0.96
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-// BME280
 #include <Adafruit_BMP280.h>
-// MPU
 #include "MPU9250.h"
-// Web Server
 #include <WiFi.h>
 #include <WebServer.h>
-// Comunication
 #include <esp_now.h>
 
+// ==================== ESTRUCTURA DE DATOS ====================
 typedef struct __attribute__((packed)) {
   uint32_t timestamp;
   int32_t heartRate;
   int32_t spo2;
   float temperature;
-  float humidity;
   float pressure;
   float roll;
   float pitch;
@@ -55,18 +49,21 @@ typedef struct __attribute__((packed)) {
 uint8_t receiverAddress[] = {0x68, 0x25, 0xDD, 0x2F, 0xCA, 0x9C};
 esp_now_peer_info_t peerInfo;
 
-// --- Configuración de Pantalla OLED ---
+// ==================== CONFIGURACIÓN ============================
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define OLED_ADDRESS 0x3C
+// ==================== PINES I2C ================================
+#define I2C_SDA 21
+#define I2C_SCL 22
 
-// --- Configuración Servidor Web ---
+// =================== Configuración Servidor Web ================
 const char* ssid = "ALMA_DASHBOARD";
-const char* password = ""; // Sin contraseña para acceso rápido en competencia, modifícalo si quieres
+const char* password = "";
 WebServer server(80);
 
-// --- Interfaz Web (HTML + CSS + JS) alojada en PROGMEM ---
+// ======= Interfaz Web (HTML + CSS + JS) alojada en PROGMEM ==========
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
 <head>
@@ -123,52 +120,48 @@ setInterval(function() {
 </html>
 )rawliteral";
 
-// --- Configuración de Pines I2C para ESP32 (General) ---
-#define I2C_SDA 21
-#define I2C_SCL 22
-
-// --- Configuración del MAX30102 ---
+// ============== CONFIGURACIÓN MAX30102 ==========================
 #define MAX30102_SAMPLES 100      // Tamaño del buffer para el algoritmo SpO2
 #define RATE_SIZE 4                // Tamaño del buffer para el filtro de media móvil de BPM
 #define SPO2_SIZE 4                // Tamaño del buffer para el filtro de media móvil de SpO2
 #define SIGNAL_QUALITY_THRESHOLD 50000 // Umbral para considerar buena señal PPG
 
-// --- Umbrales y Configuración de Caídas ---
+// ================ Umbrales y Configuración de Caídas ================
 #define FALL_IMPACT_THRESHOLD 3.5  // Umbral de impacto (Fuerza G)
 #define FALL_INACTIVITY_TIME 3000  // Tiempo de inactividad post-impacto (ms)
 #define FALL_ANGLE_THRESHOLD 50     // Ángulo para confirmar caída (grados)
 
-// --- Configuración de Temporizadores ---
+// ================ Configuración de Temporizadores ================
 const unsigned long LORA_INTERVAL = 5000;   // Enviar datos cada 5 segundos (para pruebas)
 const unsigned long OLED_INTERVAL = 200;    // Actualizar OLED cada 200ms (reduce parpadeo)
 const unsigned long WATCHDOG_TIMEOUT = 1000; // Timeout del watchdog (1 segundo)
 
-// --- Configuración de Low Power Mode ---
+// ================ Configuración de Low Power Mode ================
 const unsigned long INACTIVITY_TIMEOUT = 300000; // 5 minutos sin movimiento para low power
 const float MOTION_THRESHOLD = 0.1;              // Umbral de movimiento para despertar (G's)
 unsigned long lastMotionTime = 0;
 bool lowPowerMode = false;
 
-// --- Instancias de Sensores (Globales pero protegidas por Mutex) ---
+// ================ Instancias de Sensores (Globales pero protegidas por Mutex) ================
 MAX30105 particleSensor;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 MPU9250 mpu;
 Adafruit_BMP280 bme;
 
-// --- Variables de Estado de Sensores (para modo seguro) ---
+// ================ Variables de Estado de Sensores (para modo seguro) ================
 bool bme_present = false;
 bool mpu_present = false;
 bool max_present = false;
 bool oled_present = false;
 
-// --- Sincronización FreeRTOS ---
+// ==================== Sincronización FreeRTOS ====================
 SemaphoreHandle_t i2cMutex;
 SemaphoreHandle_t dataMutex;      // Mutex específico para proteger el struct g_data
 TaskHandle_t biometricTaskHandle = NULL;
 TaskHandle_t fallTaskHandle = NULL;
 
-// --- ESTRUCTURA DE DATOS GLOBAL ---
+// ==================== ESTRUCTURA DE DATOS GLOBAL ====================
 typedef struct {
   // Biométricos
   int32_t heartRate;
@@ -191,7 +184,7 @@ typedef struct {
 
 SensorData g_data;
 
-// --- Buffers y Filtros para MAX30102 ---
+// ==================== Buffers y Filtros para MAX30102 ====================
 uint32_t irBuffer[MAX30102_SAMPLES];
 uint32_t redBuffer[MAX30102_SAMPLES];
 uint32_t samplesCollected = 0;
@@ -200,22 +193,22 @@ int32_t hr_buffer[RATE_SIZE];
 uint8_t spo2_buffer_index = 0;
 uint8_t hr_buffer_index = 0;
 
-// --- MEJORA ELITE: Filtro de outliers (sanity check) ---
+// ==================== MEJORA ELITE: Filtro de outliers (sanity check) ====================
 int32_t lastValidHR = 70;       // Valor inicial típico
 int32_t lastValidSpO2 = 97;     // Valor inicial típico
 const float MAX_HR_CHANGE = 0.25; // 10% de cambio máximo permitido
 const int MAX_REJECTION_COUNT = 3;     // Reducimos de 5 a 3 para converger más rápido
 
-// --- Variables para el Filtro Madgwick (Orientación) ---
+// ==================== Variables para el Filtro Madgwick (Orientación) ====================
 float beta = 0.1f;  // Ganancia del filtro Madgwick
 float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f; // Cuaternión
 float pitchOffset = 0.0f;  // MEJORA ELITE: Offset para calibración de nivel
 float rollOffset = 0.0f;
 
-// --- Watchdog por Software ---
+// ==================== Watchdog por Software ====================
 unsigned long lastTaskReset[2] = {0, 0}; // 0: BiometricTask, 1: Loop (Core1)
 
-// --- Prototipos de Funciones ---
+// ==================== Prototipos de Funciones ====================
 void actualizarOLED();
 void enviarTelemetria();
 void filtroCaidas(float mag, float inclination);
@@ -228,7 +221,7 @@ bool sanityCheckHR(int32_t newHR);
 bool sanityCheckSpO2(int32_t newSpO2);
 void checkLowPowerMode(float magnitude);
 
-// --- Manejadores del Servidor Web ---
+// ==================== Manejadores del Servidor Web ====================
 void handleRoot() {
   server.send_P(200, "text/html", index_html);
 }
@@ -259,7 +252,7 @@ void handleData() {
   server.send(200, "application/json", json);
 }
 
-// --- TAREA AISLADA PARA EL SERVIDOR WEB (CORE 0) ---
+// ============= TAREA AISLADA PARA EL SERVIDOR WEB (CORE 0) =============
 void WebServerTask(void *pvParameters) {
   Serial.println("[WebServer] Tarea iniciada en Core 0");
   for (;;) {
@@ -898,6 +891,7 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
   recipNorm = 1.0f / qNorm;
   q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
 }
+
 // --- FILTRO DE CAÍDAS --- ✅
 void filtroCaidas(float mag, float inclination) {
   bool currentFallState = false;

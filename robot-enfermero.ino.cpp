@@ -8,7 +8,6 @@ typedef struct __attribute__((packed)) {
   int32_t heartRate;
   int32_t spo2;
   float temperature;
-  float humidity;
   float pressure;
   float roll;
   float pitch;
@@ -22,7 +21,6 @@ typedef struct __attribute__((packed)) {
 TelemetryPacket incomingData;
 volatile bool mensaje_recibido = false;
 
-// Callback de recepción
 void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
   // Verificación analítica de integridad: ¿El tamaño del paquete coincide?
   if (len == sizeof(TelemetryPacket)) {
