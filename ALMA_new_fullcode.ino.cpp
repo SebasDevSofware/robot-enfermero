@@ -27,7 +27,6 @@
 #include <Adafruit_BMP280.h>
 #include "MPU9250.h"
 #include <WiFi.h>
-#include <WebServer.h>
 #include <esp_now.h>
 
 // ==================== ESTRUCTURA DE DATOS ====================
@@ -57,68 +56,6 @@ esp_now_peer_info_t peerInfo;
 // ==================== PINES I2C ================================
 #define I2C_SDA 21
 #define I2C_SCL 22
-
-// =================== Configuración Servidor Web ================
-const char* ssid = "ALMA_DASHBOARD";
-const char* password = "";
-WebServer server(80);
-
-// ======= Interfaz Web (HTML + CSS + JS) alojada en PROGMEM ==========
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ALMA Telemetría</title>
-  <style>
-    body { font-family: 'Courier New', Courier, monospace; background-color: #0a0a0a; color: #00ffcc; text-align: center; margin: 0; padding: 20px; }
-    h2 { color: #ffffff; border-bottom: 1px solid #333; padding-bottom: 10px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; max-width: 800px; margin: 20px auto; }
-    .card { background: #1a1a1a; border: 1px solid #333; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,255,204,0.1); }
-    .value { font-size: 1.8em; font-weight: bold; margin-top: 10px; }
-    .status-alert { color: #ff3333; animation: blinker 1s linear infinite; }
-    @keyframes blinker { 50% { opacity: 0; } }
-  </style>
-</head>
-<body>
-  <h2>[ ALMA - Asistente Logístico de Monitoreo Avanzado ] Dashboard en Vivo</h2>
-  <div class="card" style="max-width: 800px; margin: 0 auto; margin-bottom: 15px;">
-    <div>Estado Global: <span id="estado" class="value" style="color: #fff;">ESPERANDO DATOS</span></div>
-  </div>
-  <div class="grid">
-    <div class="card"><div>BPM</div><div id="hr" class="value">--</div></div>
-    <div class="card"><div>SpO2 (%)</div><div id="spo2" class="value">--</div></div>
-    <div class="card"><div>Temp (°C)</div><div id="temp" class="value">--</div></div>
-    <div class="card"><div>Pitch (°)</div><div id="pitch" class="value">--</div></div>
-    <div class="card"><div>Mag (G)</div><div id="mag" class="value">--</div></div>
-    <div class="card"><div>Señal PPG</div><div id="signal" class="value">--</div></div>
-  </div>
-<script>
-setInterval(function() {
-  fetch('/data').then(response => response.json()).then(data => {
-    document.getElementById("hr").innerText = data.hr;
-    document.getElementById("spo2").innerText = data.spo2;
-    document.getElementById("temp").innerText = data.temp.toFixed(2);
-    document.getElementById("pitch").innerText = data.pitch.toFixed(1);
-    document.getElementById("mag").innerText = data.mag.toFixed(2);
-    
-    let estadoEl = document.getElementById("estado");
-    estadoEl.innerText = data.estado;
-    if(data.fall == 1) {
-        estadoEl.className = "value status-alert";
-    } else {
-        estadoEl.className = "value";
-        estadoEl.style.color = "#00ffcc";
-    }
-    
-    document.getElementById("signal").innerText = data.signal ? "ÓPTIMA" : "DÉBIL";
-    document.getElementById("signal").style.color = data.signal ? "#00ffcc" : "#ff9900";
-  }).catch(err => console.log(err));
-}, 250); // Fetch cada 250ms (4Hz) para fluidez sin saturar el bus
-</script>
-</body>
-</html>
-)rawliteral";
 
 // ============== CONFIGURACIÓN MAX30102 ==========================
 #define MAX30102_SAMPLES 100      // Tamaño del buffer para el algoritmo SpO2
@@ -193,11 +130,33 @@ int32_t hr_buffer[RATE_SIZE];
 uint8_t spo2_buffer_index = 0;
 uint8_t hr_buffer_index = 0;
 
-// ==================== MEJORA ELITE: Filtro de outliers (sanity check) ====================
-int32_t lastValidHR = 70;       // Valor inicial típico
-int32_t lastValidSpO2 = 97;     // Valor inicial típico
-const float MAX_HR_CHANGE = 0.25; // 10% de cambio máximo permitido
-const int MAX_REJECTION_COUNT = 3;     // Reducimos de 5 a 3 para converger más rápido
+// ==================== MEJORA ELITE: SISTEMA DE FUSIÓN SENSORIAL Y CONFIANZA DINÁMICA ====================
+enum BiometricState {
+    STATE_NO_FINGER,    // Sensor vacío o señal insuficiente
+    STATE_ACQUIRING,   // Dedo detectado, buscando pulso estable (Warm-up)
+    STATE_LOCKED       // Seguimiento fisiológico estricto
+};
+
+struct ConfidenceManager {
+    BiometricState state = STATE_NO_FINGER;
+    uint32_t lastValidTimestampHR = 0;      // Timestamp independiente para HR
+    uint32_t lastValidTimestampSpO2 = 0;    // Timestamp independiente para SpO2
+    int32_t lastStableHR = 70;
+    int32_t lastStableSpO2 = 97;
+    int acquiringCycles = 0;
+    
+    // Parámetros Fisiológicos
+    const float MAX_BPM_PER_SEC = 4.0f;      // Máximo cambio real en humanos
+    const float MAX_SPO2_PER_SEC = 0.5f;     // El SpO2 cambia muy lento
+    const int   ACQUIRING_REQUIRED = 5;      // Ciclos para considerar "LOCKED"
+    
+    // Parámetros de IMU (G's)
+    const float MAG_IDEAL = 1.0f;
+    const float MAG_TOLERANCE = 0.15f;       // Ventana de 0.85G a 1.15G para HR
+    const float MAG_TOLERANCE_SPO2 = 0.25f;  // Tolerancia relajada para SpO2
+};
+
+ConfidenceManager vld;
 
 // ==================== Variables para el Filtro Madgwick (Orientación) ====================
 float beta = 0.1f;  // Ganancia del filtro Madgwick
@@ -220,47 +179,6 @@ void calibrarNivel();
 bool sanityCheckHR(int32_t newHR);
 bool sanityCheckSpO2(int32_t newSpO2);
 void checkLowPowerMode(float magnitude);
-
-// ==================== Manejadores del Servidor Web ====================
-void handleRoot() {
-  server.send_P(200, "text/html", index_html);
-}
-
-void handleData() {
-  SensorData localData;
-  // Copia segura de datos, idéntico a tu lógica de telemetría actual
-  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
-    xSemaphoreGive(dataMutex);
-  } else {
-    server.send(503, "application/json", "{\"error\":\"Mutex timeout\"}");
-    return;
-  }
-
-  // Construcción manual de JSON para evitar librerías pesadas
-  String json = "{";
-  json += "\"hr\":" + String(localData.heartRate) + ",";
-  json += "\"spo2\":" + String(localData.spo2) + ",";
-  json += "\"temp\":" + String(localData.temperature) + ",";
-  json += "\"pitch\":" + String(localData.pitch) + ",";
-  json += "\"mag\":" + String(localData.magnitude) + ",";
-  json += "\"fall\":" + String(localData.fallDetected ? 1 : 0) + ",";
-  json += "\"signal\":" + String(localData.signalQuality ? 1 : 0) + ",";
-  json += "\"estado\":\"" + String(localData.estadoGlobal) + "\"";
-  json += "}";
-
-  server.send(200, "application/json", json);
-}
-
-// ============= TAREA AISLADA PARA EL SERVIDOR WEB (CORE 0) =============
-void WebServerTask(void *pvParameters) {
-  Serial.println("[WebServer] Tarea iniciada en Core 0");
-  for (;;) {
-    server.handleClient();
-    enviarTelemetria();
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-}
 
 // ******************************
 // * TAREA CORE 0: BIOMETRÍA    * ✅ (Versión Corregida v1000%)
@@ -298,42 +216,40 @@ void BiometricTask(void *pvParameters) {
       xSemaphoreGive(i2cMutex);
     }
 
-    // --- 2. PROCESAMIENTO CUANDO EL BUFFER ESTÁ LLENO ---
+        // --- PROCESAMIENTO CUANDO EL BUFFER ESTÁ LLENO ---
     if (samplesCollected >= MAX30102_SAMPLES) {
       float avgSignal = signalQualitySum / MAX30102_SAMPLES;
       bool goodSignal = (avgSignal > SIGNAL_QUALITY_THRESHOLD);
 
-      // Actualizar calidad de señal (esto controla la barra de la OLED)
       if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
         g_data.signalQuality = goodSignal;
         xSemaphoreGive(dataMutex);
       }
 
       if (goodSignal) {
-        // Ejecutar algoritmo de Maxim
         maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX30102_SAMPLES, redBuffer, &spo2, &validSPO2, &hr, &validHR);
 
-        // Actualizar datos de forma segura si son lógicos
-        if (validHR && sanityCheckHR(hr)) {
-          if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-            g_data.heartRate = hr; // Simplificado: quitamos el array de media móvil que añadía latencia
-            lastValidHR = hr;
-            xSemaphoreGive(dataMutex);
+        // Validar y actualizar
+        bool hrValid = validHR && sanityCheckHR(hr);
+        
+        if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+          // Publicamos el valor del ConfidenceManager (que ya está filtrado y estabilizado)
+          g_data.heartRate = vld.lastStableHR; 
+          
+          if (validSPO2 && sanityCheckSpO2(spo2)) {
+            g_data.spo2 = vld.lastStableSpO2;
           }
-        }
-
-        if (validSPO2 && sanityCheckSpO2(spo2)) {
-          if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-            g_data.spo2 = spo2; // Simplificado
-            lastValidSpO2 = spo2;
-            xSemaphoreGive(dataMutex);
-          }
+          xSemaphoreGive(dataMutex);
         }
       } else {
-        // Si no hay dedo, NO reseteamos los BPM a 0 de inmediato.
-        // Dejamos que la OLED muestre el último dato, pero g_data.signalQuality = false
-        // alertará visualmente que la lectura actual no es fiable.
-        Serial.println("[Biometria] Baja calidad de señal. Manteniendo último valor conocido.");
+        Serial.println("[Biometria] Sin señal. Reset.");
+        vld.state = STATE_NO_FINGER;
+        vld.lastValidTimestampHR = 0;   // Reset de timestamps para forzar 
+        vld.lastValidTimestampSpO2 = 0; // sincronización limpia al reconectar
+        if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+          g_data.heartRate = 0; // Solo aquí permitimos el 0
+          xSemaphoreGive(dataMutex);
+        }
       }
 
       // --- DESPLAZAMIENTO DE VENTANA (Sliding Window) ---
@@ -441,11 +357,8 @@ void setup() {
 
   lastMotionTime = millis();
 
-  // --- INICIO CÓDIGO NUEVO: WEB SERVER ---
-  Serial.println("[Red] Configurando Access Point...");
-  // FORZAMOS EL CANAL 1 PARA EVITAR PÉRDIDA DE PAQUETES CON ESP-NOW
-  WiFi.softAP(ssid, password, 1); 
-  IPAddress IP = WiFi.softAPIP();
+  // --- CONFIGURACIÓN WIFI PARA ESP-NOW ---
+  WiFi.mode(WIFI_STA);
   
   // Inicializar ESP-NOW
   if (esp_now_init() != ESP_OK) {
@@ -459,30 +372,12 @@ void setup() {
   peerInfo.channel = 1;  
   peerInfo.encrypt = false;
 
-  peerInfo.ifidx = WIFI_IF_AP;
-  
   if (esp_now_add_peer(&peerInfo) != ESP_OK){
     Serial.println("[ERROR] Fallo al añadir el peer ESP-NOW");
     return;
   }
   
-  Serial.print("[Red] AP Iniciado. IP para conectar: ");
-  Serial.println(IP); // Usualmente es 192.168.4.1
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/data", HTTP_GET, handleData);
-  server.begin();
-
-  // Crear Tarea del Servidor en el Núcleo 0 (Prioridad 0, más baja que Biometría)
-  xTaskCreatePinnedToCore(
-    WebServerTask,
-    "WebServerTask",
-    4096,
-    NULL,
-    0, // Prioridad 0
-    NULL,
-    0  // Core 0
-  );
+  Serial.println("[Red] WiFi y ESP-NOW listos.");
 
   // --- Crear Tarea en el Núcleo 0 ---
   xTaskCreatePinnedToCore(
@@ -659,73 +554,118 @@ void calibrarNivel() {
   Serial.printf("[Calibracion] Offset - Pitch: %.2f, Roll: %.2f\n", pitchOffset, rollOffset);
 }
 
-// Sanity Check para HR --- ✅
-#define SIGNAL_QUALITY_THRESHOLD 20000
+// ==================== Buffers para Suavizado Final ====================
+#define HR_FILTER_SIZE 4
+int32_t hrHistory[HR_FILTER_SIZE];
+uint8_t hrHistoryIdx = 0;
 
-// --- FUNCIÓN DE VALIDACIÓN CORREGIDA ---
+// --- FUNCIÓN DE VALIDACIÓN ELITE (VERSIÓN ESTABILIZADA v2) ---
 bool sanityCheckHR(int32_t newHR) {
-  // Límite fisiológico absoluto
-  if (newHR < 40 || newHR > 200) return false;
+    uint32_t now = millis();
+    float currentMag = 1.0f;
+    
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        currentMag = g_data.magnitude;
+        xSemaphoreGive(dataMutex);
+    }
 
-  // Enganche inicial
-  if (g_data.heartRate == 0) {
-    lastValidHR = newHR;
-    return true;
-  }
+    // 1. Fusión Sensorial Estricta
+    if (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE) return false;
 
-  // Evaluar fluctuación
-  float change = abs(newHR - lastValidHR) / (float)lastValidHR;
-  if (change <= 0.40) {
-    return true;
-  }
+    // 2. Límites Fisiológicos Reales
+    if (newHR < 45 || newHR > 180) return false;
 
-  // Mecanismo de recuperación (evita que el filtro rechace un cambio real permanente)
-  static int failedAttemptsHR = 0;
-  failedAttemptsHR++;
+    float dt = (now - vld.lastValidTimestampHR) / 1000.0f;
+    if (dt <= 0 || dt > 2.0f) dt = 0.5f;
 
-  if (failedAttemptsHR > 3) {
-    lastValidHR = newHR;
-    failedAttemptsHR = 0;
-    return true;
-  }
+    switch (vld.state) {
+        case STATE_NO_FINGER:
+            // ANCLA FISIOLÓGICA: Empezamos en un rango lógico (75 BPM)
+            vld.state = STATE_ACQUIRING;
+            vld.acquiringCycles = 0;
+            vld.lastStableHR = 75; 
+            vld.lastValidTimestampHR = now;
+            vld.lastValidTimestampSpO2 = 0; // Forzar Cold Start en SpO2
+            return false; 
 
-  return false;
-}
-// Sanity Check para SpO2 --- ✅
-const float MAX_SPO2_CHANGE = 0.10; // 5% de cambio máximo permitido (mucho más estricto que HR)
+        case STATE_ACQUIRING:
+            // CONVERGENCIA CONTROLADA (8 BPM/seg):
+            if (abs(newHR - vld.lastStableHR) < (8.0f * dt)) {
+                vld.acquiringCycles++;
+                vld.lastStableHR = newHR;
+                vld.lastValidTimestampHR = now;
+                if (vld.acquiringCycles >= vld.ACQUIRING_REQUIRED) vld.state = STATE_LOCKED;
+                return true;
+            } else {
+                // Convergencia lenta hacia el valor objetivo para evitar saltos
+                if (newHR > vld.lastStableHR) vld.lastStableHR += 1;
+                else vld.lastStableHR -= 1;
+                return false;
+            }
 
-bool sanityCheckSpO2(int32_t newSpO2) {
-  // 1. Límite fisiológico duro: Valores bajo 80% son ruido o el sensor está suelto. >100% es físicamente imposible.
-  if (newSpO2 < 85 || newSpO2 > 100) {
-    return false;
-  }
+        case STATE_LOCKED:
+            // SEGUIMIENTO ESTRICTO (3 BPM/seg) + Filtro Anti-Doble Pulso
+            if (newHR > (vld.lastStableHR * 1.8f)) return false; 
 
-  // 2. Enganche inicial seguro (asumiendo que 97 era tu valor por defecto en las variables globales)
-  if (lastValidSpO2 == 0 || lastValidSpO2 == 97) {
-    lastValidSpO2 = newSpO2;
-    return true;
-  }
-
-  // 3. Evaluar la fluctuación porcentual
-  float change = abs(newSpO2 - lastValidSpO2) / (float)lastValidSpO2;
-
-  if (change <= MAX_SPO2_CHANGE) {
-    return true;
-  } else {
-    // 4. Mecanismo de recuperación (Soft Reset)
-    // Si el SpO2 realmente cayó drásticamente (ej. un evento médico real)
-    // y se mantiene ahí, debemos permitir que el algoritmo acepte la nueva realidad
-    // después de unos cuantos ciclos de confirmación.
-    static int failedAttemptsSpO2 = 0;
-    failedAttemptsSpO2++;
-
-    if (failedAttemptsSpO2 > 5) { // Tras 5 lecturas anómalas consecutivas, aceptamos el nuevo valor
-      lastValidSpO2 = newSpO2;
-      failedAttemptsSpO2 = 0;
-      return true;
+            float maxAllowed = vld.MAX_BPM_PER_SEC * dt;
+            if (abs(newHR - vld.lastStableHR) <= (maxAllowed + 1.5f)) {
+                vld.lastStableHR = newHR;
+                vld.lastValidTimestampHR = now;
+                return true;
+            } else {
+                static int outlierCount = 0;
+                if (++outlierCount > 5) {
+                    vld.state = STATE_ACQUIRING;
+                    vld.acquiringCycles = 0;
+                    outlierCount = 0;
+                }
+            }
+            break;
     }
     return false;
-  }
+}
+
+// --- VALIDACIÓN DE OXIGENACIÓN CON FILTRO DE ESTABILIDAD ---
+bool sanityCheckSpO2(int32_t newSpO2) {
+    if (newSpO2 < 85 || newSpO2 > 100) return false;
+
+    float currentMag = 1.0f;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        currentMag = g_data.magnitude;
+        xSemaphoreGive(dataMutex);
+    }
+    
+    // Si hay movimiento excesivo, el SpO2 es la primera señal en corromperse
+    // Usamos la tolerancia relajada (0.25G) asimétrica
+    if (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE_SPO2) return false;
+
+    uint32_t now = millis();
+
+    // SEMILLA DE ARRANQUE DINÁMICA (Cold Start)
+    if (vld.lastValidTimestampSpO2 == 0) {
+        if (newSpO2 >= 90) { // Aceptar primer valor lógico directamente
+            vld.lastStableSpO2 = newSpO2;
+            vld.lastValidTimestampSpO2 = now;
+            return true;
+        }
+        return false;
+    }
+
+    // Cálculo de dt independiente
+    float dt = (now - vld.lastValidTimestampSpO2) / 1000.0f;
+    
+    if (vld.state == STATE_LOCKED) {
+        if (dt > 0 && dt < 2.0f) {
+            // El SpO2 cambia muy lento, permitimos 0.5% por segundo
+            if (abs(newSpO2 - vld.lastStableSpO2) > (vld.MAX_SPO2_PER_SEC * dt + 1.0f)) {
+                return false;
+            }
+        }
+    }
+
+    vld.lastStableSpO2 = newSpO2;
+    vld.lastValidTimestampSpO2 = now;
+    return true;
 }
 
 // --- Low Power Mode --- ✅
@@ -1033,8 +973,9 @@ void enviarTelemetria() {
   packet.fallDetected = localData.fallDetected ? 1 : 0;
   packet.signalQuality = localData.signalQuality ? 1 : 0;
 
-  // Filtro analítico: Solo enviamos si hay datos válidos o una emergencia (caída)
-  if (packet.heartRate > 0 || packet.fallDetected) {
+  bool biometriaValida = localData.signalQuality && (packet.heartRate > 0) && (packet.spo2 > 0);
+
+  if (biometriaValida) {
     
     esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
      
