@@ -1,4 +1,4 @@
-# ALMA Project Architecture & Coding Guidelines (GEMINI.md)
+# Biochronoritmic - ALMA Project Architecture & Coding Guidelines (GEMINI.md)
 
 ## 1. Filosofía de Desarrollo
 * **Estabilidad Crítica:** ALMA es un dispositivo médico/telemetría. El código C++ en el ESP32 utiliza FreeRTOS. **NO modifiques** la lógica de los Mutex (`i2cMutex`, `dataMutex`), las prioridades de las tareas, ni el Filtro Madgwick a menos que se solicite explícitamente.

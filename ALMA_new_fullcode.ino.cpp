@@ -229,25 +229,30 @@ void BiometricTask(void *pvParameters) {
       if (goodSignal) {
         maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX30102_SAMPLES, redBuffer, &spo2, &validSPO2, &hr, &validHR);
 
-        // Validar y actualizar
-        bool hrValid = validHR && sanityCheckHR(hr);
+        // Validar y actualizar mediante el ConfidenceManager
+        if (validHR) sanityCheckHR(hr);
+        if (validSPO2) sanityCheckSpO2(spo2);
         
         if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-          // Publicamos el valor del ConfidenceManager (que ya está filtrado y estabilizado)
-          g_data.heartRate = vld.lastStableHR; 
-          
-          if (validSPO2 && sanityCheckSpO2(spo2)) {
+          // Solo publicamos valores si el sistema está en estado LOCKED (señal 100% confiable)
+          if (vld.state == STATE_LOCKED) {
+            g_data.heartRate = vld.lastStableHR;
             g_data.spo2 = vld.lastStableSpO2;
+          } else {
+            // Mientras se adquiere o estabiliza, mostramos 0
+            g_data.heartRate = 0;
+            g_data.spo2 = 0;
           }
           xSemaphoreGive(dataMutex);
         }
       } else {
-        Serial.println("[Biometria] Sin señal. Reset.");
+        Serial.println("[Biometria] Sin señal o mala calidad. Reset.");
         vld.state = STATE_NO_FINGER;
-        vld.lastValidTimestampHR = 0;   // Reset de timestamps para forzar 
-        vld.lastValidTimestampSpO2 = 0; // sincronización limpia al reconectar
+        vld.lastValidTimestampHR = 0;   
+        vld.lastValidTimestampSpO2 = 0; 
         if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-          g_data.heartRate = 0; // Solo aquí permitimos el 0
+          g_data.heartRate = 0;
+          g_data.spo2 = 0;
           xSemaphoreGive(dataMutex);
         }
       }
@@ -541,7 +546,7 @@ void calibrarNivel() {
         aplicarFiltroMadgwick(ax, ay, az, gx, gy, gz, mx, my, mz, 0.01f);
 
         sumPitch += asin(2.0f * (q0 * q2 - q3 * q1)) * 180.0f / PI;
-        sumRoll += atan2(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * 180.0f / PI;
+        sumRoll += atan2(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q3)) * 180.0f / PI;
       }
       xSemaphoreGive(i2cMutex);
     }
@@ -569,44 +574,44 @@ bool sanityCheckHR(int32_t newHR) {
         xSemaphoreGive(dataMutex);
     }
 
-    // 1. Fusión Sensorial Estricta
-    if (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE) return false;
-
-    // 2. Límites Fisiológicos Reales
+    // 1. Límites Fisiológicos Reales
     if (newHR < 45 || newHR > 180) return false;
 
     float dt = (now - vld.lastValidTimestampHR) / 1000.0f;
     if (dt <= 0 || dt > 2.0f) dt = 0.5f;
 
+    // 2. Chequeo de Movimiento (Solo bloquea la estabilidad en LOCKED, no la detección inicial)
+    bool motionExcessive = (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE);
+
     switch (vld.state) {
         case STATE_NO_FINGER:
-            // ANCLA FISIOLÓGICA: Empezamos en un rango lógico (75 BPM)
             vld.state = STATE_ACQUIRING;
             vld.acquiringCycles = 0;
             vld.lastStableHR = 75; 
             vld.lastValidTimestampHR = now;
-            vld.lastValidTimestampSpO2 = 0; // Forzar Cold Start en SpO2
-            return false; 
+            return true; 
 
         case STATE_ACQUIRING:
-            // CONVERGENCIA CONTROLADA (8 BPM/seg):
-            if (abs(newHR - vld.lastStableHR) < (8.0f * dt)) {
+            // CONVERGENCIA RÁPIDA (12 BPM/seg)
+            if (abs(newHR - vld.lastStableHR) < (12.0f * dt)) {
                 vld.acquiringCycles++;
                 vld.lastStableHR = newHR;
                 vld.lastValidTimestampHR = now;
-                if (vld.acquiringCycles >= vld.ACQUIRING_REQUIRED) vld.state = STATE_LOCKED;
+                if (vld.acquiringCycles >= vld.ACQUIRING_REQUIRED && !motionExcessive) {
+                    vld.state = STATE_LOCKED;
+                }
                 return true;
             } else {
-                // Convergencia lenta hacia el valor objetivo para evitar saltos
                 if (newHR > vld.lastStableHR) vld.lastStableHR += 1;
                 else vld.lastStableHR -= 1;
                 return false;
             }
 
         case STATE_LOCKED:
-            // SEGUIMIENTO ESTRICTO (3 BPM/seg) + Filtro Anti-Doble Pulso
+            if (motionExcessive) return false; // Bloquear actualización si hay mucho movimiento
+            
             if (newHR > (vld.lastStableHR * 1.8f)) return false; 
-
+            
             float maxAllowed = vld.MAX_BPM_PER_SEC * dt;
             if (abs(newHR - vld.lastStableHR) <= (maxAllowed + 1.5f)) {
                 vld.lastStableHR = newHR;
@@ -614,7 +619,7 @@ bool sanityCheckHR(int32_t newHR) {
                 return true;
             } else {
                 static int outlierCount = 0;
-                if (++outlierCount > 5) {
+                if (++outlierCount > 10) { // Más tolerancia a outliers antes de bajar a ACQUIRING
                     vld.state = STATE_ACQUIRING;
                     vld.acquiringCycles = 0;
                     outlierCount = 0;
@@ -797,9 +802,9 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
 
     // Gradiente descendente
     s0 = -_2q2 * (2.0f * q1q3 - _2q0q2 - ax) + _2q1 * (2.0f * q0q1 + _2q2q3 - ay) - _2bz * q2 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) + _2q0 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q1 * (1.0f - 2.0f * q1q1 - 2.0f * q2q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) + _2q3 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q2 * (1.0f - 2.0f * q1q1 - 2.0f * q2q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
-    s3 = _2q1 * (2.0f * q1q3 - _2q0q2 - ax) + _2q2 * (2.0f * q0q1 + _2q2q3 - ay) + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) + _2q0 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q1 * (1.0f - 2.0f * q1q1 - 2.0f * q2q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (0.5f - q1q1 - q2q2) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) + _2q3 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q2 * (1.0f - 2.0f * q1q1 - 2.0f * q2q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (0.5f - q1q1 - q2q2) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s3 = _2q1 * (2.0f * q1q3 - _2q0q2 - ax) + _2q2 * (2.0f * q0q1 + _2q2q3 - ay) + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (0.5f - q1q1 - q2q2) - my) + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
 
     // Normalizar paso del gradiente
     float sNorm = sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
@@ -973,9 +978,10 @@ void enviarTelemetria() {
   packet.fallDetected = localData.fallDetected ? 1 : 0;
   packet.signalQuality = localData.signalQuality ? 1 : 0;
 
-  bool biometriaValida = localData.signalQuality && (packet.heartRate > 0) && (packet.spo2 > 0);
+  // Verificación de señal buena y confiable (LOCKED) antes de mandar el paquete
+  bool biometriaConfiable = localData.signalQuality && (vld.state == STATE_LOCKED);
 
-  if (biometriaValida) {
+  if (biometriaConfiable && (packet.heartRate > 0) && (packet.spo2 > 0)) {
     
     esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
      
@@ -1016,5 +1022,7 @@ void checkWatchdog() {
     Serial.println("[WATCHDOG] Timeout en Loop Principal! Reseteando I2C...");
     resetI2CBus();
     lastTaskReset[1] = millis();
+  }
+}
   }
 }
