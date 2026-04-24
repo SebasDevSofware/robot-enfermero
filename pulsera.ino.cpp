@@ -1,6 +1,6 @@
 // ===================================================================
 // |                                                                 |
-// |  BIOCHRONORITMIC  - Asistente Logístico de Monitoreo Avanzado   |    |                                                                 |
+// |  BIOCHRONORITMIC  - Asistente Logístico de Monitoreo Avanzado   |
 // |                                                                 |
 // |  Características:                                               |
 // |  - Multi-tarea optimizada (Core 0: Biometría / Core 1: Mov.)    |
@@ -187,7 +187,7 @@ typedef struct {
 SensorData g_data;
 
 // =================== MAC Dirección ============================
-uint8_t receiverAddress[] = {0x24, 0xDC, 0xC3, 0x48, 0x77, 0x94};
+uint8_t receiverAddress[] = { 0x24, 0xDC, 0xC3, 0x48, 0x77, 0x94 };
 esp_now_peer_info_t peerInfo;
 
 // ==================== CONFIGURACIÓN OLED ======================
@@ -247,26 +247,26 @@ uint8_t spo2_buffer_index = 0;
 uint8_t hr_buffer_index = 0;
 
 enum BiometricState {
-    STATE_NO_FINGER,
-    STATE_ACQUIRING,
-    STATE_LOCKED
+  STATE_NO_FINGER,
+  STATE_ACQUIRING,
+  STATE_LOCKED
 };
 
 struct ConfidenceManager {
-    BiometricState state = STATE_NO_FINGER;
-    uint32_t lastValidTimestampHR = 0;
-    uint32_t lastValidTimestampSpO2 = 0;
-    int32_t lastStableHR = 70;
-    int32_t lastStableSpO2 = 97;
-    int acquiringCycles = 0;
-    
-    // Parámetros Fisiológicos
-    const float MAX_BPM_PER_SEC = 4.0f; 
-    const float MAX_SPO2_PER_SEC = 0.5f;
-    const int   ACQUIRING_REQUIRED = 5;
-    const float MAG_IDEAL = 1.0f;
-    const float MAG_TOLERANCE = 0.15f;
-    const float MAG_TOLERANCE_SPO2 = 0.25f;
+  BiometricState state = STATE_NO_FINGER;
+  uint32_t lastValidTimestampHR = 0;
+  uint32_t lastValidTimestampSpO2 = 0;
+  int32_t lastStableHR = 70;
+  int32_t lastStableSpO2 = 97;
+  int acquiringCycles = 0;
+
+  // Parámetros Fisiológicos
+  const float MAX_BPM_PER_SEC = 4.0f;
+  const float MAX_SPO2_PER_SEC = 0.5f;
+  const int ACQUIRING_REQUIRED = 5;
+  const float MAG_IDEAL = 1.0f;
+  const float MAG_TOLERANCE = 0.15f;
+  const float MAG_TOLERANCE_SPO2 = 0.25f;
 };
 
 ConfidenceManager vld;
@@ -278,7 +278,7 @@ float pitchOffset = 0.0f;
 float rollOffset = 0.0f;
 
 // ==================== Watchdog por Software ====================
-unsigned long lastTaskReset[2] = {0, 0};
+unsigned long lastTaskReset[2] = { 0, 0 };
 
 // ==================== Prototipos de Funciones ====================
 void actualizarOLED();
@@ -331,7 +331,7 @@ void BiometricTask(void *pvParameters) {
     if (samplesCollected >= MAX30102_SAMPLES) {
       signalQualitySum = 0;
       for (int i = 0; i < MAX30102_SAMPLES; i++) signalQualitySum += irBuffer[i];
-      
+
       float avgSignal = (float)signalQualitySum / MAX30102_SAMPLES;
       bool goodSignal = (avgSignal > SIGNAL_QUALITY_THRESHOLD);
 
@@ -342,10 +342,10 @@ void BiometricTask(void *pvParameters) {
 
       if (goodSignal) {
         maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX30102_SAMPLES, redBuffer, &spo2, &validSPO2, &hr, &validHR);
-        
+
         if (validHR) sanityCheckHR(hr);
         if (validSPO2) sanityCheckSpO2(spo2);
-        
+
         if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
           if (vld.state >= STATE_ACQUIRING) {
             g_data.heartRate = vld.lastStableHR;
@@ -359,8 +359,8 @@ void BiometricTask(void *pvParameters) {
       } else {
         Serial.println("[Biometria] Sin señal o mala calidad. Reset.");
         vld.state = STATE_NO_FINGER;
-        vld.lastValidTimestampHR = 0;   
-        vld.lastValidTimestampSpO2 = 0; 
+        vld.lastValidTimestampHR = 0;
+        vld.lastValidTimestampSpO2 = 0;
         if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
           g_data.heartRate = 0;
           g_data.spo2 = 0;
@@ -409,7 +409,7 @@ void setup() {
   dataMutex = xSemaphoreCreateMutex();
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
-  
+
   if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
     // OLED
     oled_present = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
@@ -464,17 +464,17 @@ void setup() {
 
   lastMotionTime = millis();
   WiFi.mode(WIFI_AP);
-  
+
   IPAddress local_IP(192, 168, 4, 1);
   IPAddress gateway(192, 168, 4, 1);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.softAPConfig(local_IP, gateway, subnet);
-  
-  if(WiFi.softAP(AP_SSID, AP_PASS)) {
+
+  if (WiFi.softAP(AP_SSID, AP_PASS)) {
     Serial.println("[WIFI] AP ALMA iniciado. IP: 192.168.4.1");
   }
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html);
   });
   server.addHandler(&events);
@@ -487,14 +487,14 @@ void setup() {
 
   peerInfo = {};
   memcpy(peerInfo.peer_addr, receiverAddress, 6);
-  peerInfo.channel = 1;  
+  peerInfo.channel = 1;
   peerInfo.encrypt = false;
 
-  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
     Serial.println("[ERROR] Fallo al añadir el peer ESP-NOW");
     return;
   }
-  
+
   Serial.println("[Red] WiFi y ESP-NOW listos.");
 
   xTaskCreatePinnedToCore(
@@ -504,8 +504,7 @@ void setup() {
     NULL,
     1,
     &biometricTaskHandle,
-    0
-  );
+    0);
 
   lastTaskReset[0] = millis();
   lastTaskReset[1] = millis();
@@ -518,7 +517,7 @@ void setup() {
 // =============================================
 void loop() {
   lastTaskReset[1] = millis();
-  
+
   static unsigned long lastMPURead = 0;
   unsigned long currentMicros = micros();
   float dt = 0.01f;
@@ -584,7 +583,7 @@ void loop() {
 
   SensorData localData;
   if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
+    memcpy(&localData, (const void *)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
   }
 
@@ -668,96 +667,96 @@ int32_t hrHistory[HR_FILTER_SIZE];
 uint8_t hrHistoryIdx = 0;
 
 bool sanityCheckHR(int32_t newHR) {
-    uint32_t now = millis();
-    float currentMag = 1.0f;
-    
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        currentMag = g_data.magnitude;
-        xSemaphoreGive(dataMutex);
-    }
-    if (newHR < 45 || newHR > 180) return false;
-    float dt = (now - vld.lastValidTimestampHR) / 1000.0f;
-    if (dt <= 0 || dt > 2.0f) dt = 0.5f;
-    bool motionExcessive = (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE);
+  uint32_t now = millis();
+  float currentMag = 1.0f;
 
-    switch (vld.state) {
-        case STATE_NO_FINGER:
-            vld.state = STATE_ACQUIRING;
-            vld.acquiringCycles = 0;
-            vld.lastStableHR = 75; 
-            vld.lastValidTimestampHR = now;
-            return true; 
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    currentMag = g_data.magnitude;
+    xSemaphoreGive(dataMutex);
+  }
+  if (newHR < 45 || newHR > 180) return false;
+  float dt = (now - vld.lastValidTimestampHR) / 1000.0f;
+  if (dt <= 0 || dt > 2.0f) dt = 0.5f;
+  bool motionExcessive = (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE);
 
-        case STATE_ACQUIRING:
-            if (abs(newHR - vld.lastStableHR) < (20.0f * dt)) {
-                vld.acquiringCycles++;
-                vld.lastStableHR = newHR;
-                vld.lastValidTimestampHR = now;
-                if (vld.acquiringCycles >= vld.ACQUIRING_REQUIRED && !motionExcessive) {
-                    vld.state = STATE_LOCKED;
-                }
-                return true;
-            } else {
-                if (newHR > vld.lastStableHR) vld.lastStableHR += 5;
-                else vld.lastStableHR -= 5;
-                return false;
-            }
+  switch (vld.state) {
+    case STATE_NO_FINGER:
+      vld.state = STATE_ACQUIRING;
+      vld.acquiringCycles = 0;
+      vld.lastStableHR = 75;
+      vld.lastValidTimestampHR = now;
+      return true;
 
-        case STATE_LOCKED:
-            if (motionExcessive) return false;
-            
-            if (newHR > (vld.lastStableHR * 1.8f)) return false; 
-            
-            float maxAllowed = vld.MAX_BPM_PER_SEC * dt;
-            if (abs(newHR - vld.lastStableHR) <= (maxAllowed + 1.5f)) {
-                vld.lastStableHR = newHR;
-                vld.lastValidTimestampHR = now;
-                return true;
-            } else {
-                static int outlierCount = 0;
-                if (++outlierCount > 10) {
-                    vld.state = STATE_ACQUIRING;
-                    vld.acquiringCycles = 0;
-                    outlierCount = 0;
-                }
-            }
-            break;
-    }
-    return false;
+    case STATE_ACQUIRING:
+      if (abs(newHR - vld.lastStableHR) < (20.0f * dt)) {
+        vld.acquiringCycles++;
+        vld.lastStableHR = newHR;
+        vld.lastValidTimestampHR = now;
+        if (vld.acquiringCycles >= vld.ACQUIRING_REQUIRED && !motionExcessive) {
+          vld.state = STATE_LOCKED;
+        }
+        return true;
+      } else {
+        if (newHR > vld.lastStableHR) vld.lastStableHR += 5;
+        else vld.lastStableHR -= 5;
+        return false;
+      }
+
+    case STATE_LOCKED:
+      if (motionExcessive) return false;
+
+      if (newHR > (vld.lastStableHR * 1.8f)) return false;
+
+      float maxAllowed = vld.MAX_BPM_PER_SEC * dt;
+      if (abs(newHR - vld.lastStableHR) <= (maxAllowed + 1.5f)) {
+        vld.lastStableHR = newHR;
+        vld.lastValidTimestampHR = now;
+        return true;
+      } else {
+        static int outlierCount = 0;
+        if (++outlierCount > 10) {
+          vld.state = STATE_ACQUIRING;
+          vld.acquiringCycles = 0;
+          outlierCount = 0;
+        }
+      }
+      break;
+  }
+  return false;
 }
 
 bool sanityCheckSpO2(int32_t newSpO2) {
-    if (newSpO2 < 85 || newSpO2 > 100) return false;
+  if (newSpO2 < 85 || newSpO2 > 100) return false;
 
-    float currentMag = 1.0f;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        currentMag = g_data.magnitude;
-        xSemaphoreGive(dataMutex);
+  float currentMag = 1.0f;
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    currentMag = g_data.magnitude;
+    xSemaphoreGive(dataMutex);
+  }
+  if (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE_SPO2) return false;
+  uint32_t now = millis();
+  if (vld.lastValidTimestampSpO2 == 0) {
+    if (newSpO2 >= 90) {
+      vld.lastStableSpO2 = newSpO2;
+      vld.lastValidTimestampSpO2 = now;
+      return true;
     }
-    if (abs(currentMag - vld.MAG_IDEAL) > vld.MAG_TOLERANCE_SPO2) return false;
-    uint32_t now = millis();
-    if (vld.lastValidTimestampSpO2 == 0) {
-        if (newSpO2 >= 90) {
-            vld.lastStableSpO2 = newSpO2;
-            vld.lastValidTimestampSpO2 = now;
-            return true;
-        }
+    return false;
+  }
+
+  float dt = (now - vld.lastValidTimestampSpO2) / 1000.0f;
+
+  if (vld.state == STATE_LOCKED) {
+    if (dt > 0 && dt < 2.0f) {
+      if (abs(newSpO2 - vld.lastStableSpO2) > (vld.MAX_SPO2_PER_SEC * dt + 1.0f)) {
         return false;
+      }
     }
+  }
 
-    float dt = (now - vld.lastValidTimestampSpO2) / 1000.0f;
-    
-    if (vld.state == STATE_LOCKED) {
-        if (dt > 0 && dt < 2.0f) {
-            if (abs(newSpO2 - vld.lastStableSpO2) > (vld.MAX_SPO2_PER_SEC * dt + 1.0f)) {
-                return false;
-            }
-        }
-    }
-
-    vld.lastStableSpO2 = newSpO2;
-    vld.lastValidTimestampSpO2 = now;
-    return true;
+  vld.lastStableSpO2 = newSpO2;
+  vld.lastValidTimestampSpO2 = now;
+  return true;
 }
 
 void checkLowPowerMode(float magnitude) {
@@ -789,7 +788,10 @@ void checkLowPowerMode(float magnitude) {
 void inicializarFiltroOrientacion() {
   Serial.println("[Filtro] Inicializando orientacion...");
 
-  q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
+  q0 = 1.0f;
+  q1 = 0.0f;
+  q2 = 0.0f;
+  q3 = 0.0f;
 
   for (int i = 0; i < 100; i++) {
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
@@ -818,7 +820,9 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
   if (isnan(ax) || isnan(ay) || isnan(az) || isnan(gx) || isnan(gy) || isnan(gz)) return;
   float magNorm = sqrt(mx * mx + my * my + mz * mz);
   if (magNorm < 0.001f) {
-    mx = 0; my = 0; mz = 0;
+    mx = 0;
+    my = 0;
+    mz = 0;
   }
   float recipNorm;
   float s0, s1, s2, s3;
@@ -842,11 +846,15 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
   float accNorm = sqrt(ax * ax + ay * ay + az * az);
   if (accNorm > 0.0f) {
     recipNorm = 1.0f / accNorm;
-    ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
+    ax *= recipNorm;
+    ay *= recipNorm;
+    az *= recipNorm;
     float magNorm = sqrt(mx * mx + my * my + mz * mz);
     if (magNorm > 0.0f) {
       recipNorm = 1.0f / magNorm;
-      mx *= recipNorm; my *= recipNorm; mz *= recipNorm;
+      mx *= recipNorm;
+      my *= recipNorm;
+      mz *= recipNorm;
     }
     _2q0mx = 2.0f * q0 * mx;
     _2q0my = 2.0f * q0 * my;
@@ -873,7 +881,10 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
     float sNorm = sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
     if (sNorm > 0.0f) {
       recipNorm = 1.0f / sNorm;
-      s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+      s0 *= recipNorm;
+      s1 *= recipNorm;
+      s2 *= recipNorm;
+      s3 *= recipNorm;
       qDot1 -= beta * s0;
       qDot2 -= beta * s1;
       qDot3 -= beta * s2;
@@ -888,12 +899,18 @@ void aplicarFiltroMadgwick(float ax, float ay, float az, float gx, float gy, flo
 
   float qNorm = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
   if (isnan(qNorm) || qNorm < 0.0001f) {
-    q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
+    q0 = 1.0f;
+    q1 = 0.0f;
+    q2 = 0.0f;
+    q3 = 0.0f;
     return;
   }
 
   recipNorm = 1.0f / qNorm;
-  q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
+  q0 *= recipNorm;
+  q1 *= recipNorm;
+  q2 *= recipNorm;
+  q3 *= recipNorm;
 }
 
 void filtroCaidas(float mag, float inclination) {
@@ -947,7 +964,6 @@ void filtroCaidas(float mag, float inclination) {
         strcpy(g_data.estadoGlobal, "ANALIZANDO...");
         xSemaphoreGive(dataMutex);
       }
-
     }
   } else {
     if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
@@ -969,7 +985,7 @@ void actualizarOLED() {
 
   SensorData localData;
   if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
+    memcpy(&localData, (const void *)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
   }
 
@@ -1001,7 +1017,7 @@ void actualizarOLED() {
 void enviarTelemetria() {
   SensorData localData;
   if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
+    memcpy(&localData, (const void *)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
   }
 
@@ -1015,21 +1031,21 @@ void enviarTelemetria() {
   packet.pitch = localData.pitch;
   packet.yaw = localData.yaw;
   packet.magnitude = localData.magnitude;
-  
+
   strncpy(packet.estadoGlobal, localData.estadoGlobal, sizeof(packet.estadoGlobal) - 1);
   packet.estadoGlobal[sizeof(packet.estadoGlobal) - 1] = '\0';
   packet.fallDetected = localData.fallDetected ? 1 : 0;
   packet.signalQuality = localData.signalQuality ? 1 : 0;
 
   if ((packet.heartRate > 0) && (packet.spo2 > 0)) {
-    
-    esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &packet, sizeof(packet));
-     
+
+    esp_err_t result = esp_now_send(receiverAddress, (uint8_t *)&packet, sizeof(packet));
+
     if (result == ESP_OK) {
       Serial.printf("[ESP-NOW] Envío OK | HR: %ld | Est: %s\n", packet.heartRate, packet.estadoGlobal);
     } else {
       Serial.printf("[ERROR] Código: %d | MAC: ", result);
-      for(int i=0; i<6; i++) Serial.printf("%02X%s", receiverAddress[i], (i<5)?":":"");
+      for (int i = 0; i < 6; i++) Serial.printf("%02X%s", receiverAddress[i], (i < 5) ? ":" : "");
       Serial.println();
     }
   }
@@ -1060,30 +1076,30 @@ void checkWatchdog() {
     Serial.println("[WATCHDOG] Timeout en Loop Principal! Reseteando I2C...");
     resetI2CBus();
     lastTaskReset[1] = millis();
-    }
-    }
+  }
+}
 
-    void broadcastTelemetry() {
-    SensorData localData;
-    if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-    memcpy(&localData, (const void*)&g_data, sizeof(SensorData));
+void broadcastTelemetry() {
+  SensorData localData;
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    memcpy(&localData, (const void *)&g_data, sizeof(SensorData));
     xSemaphoreGive(dataMutex);
-    }
+  }
 
-    StaticJsonDocument<512> doc;
-    doc["hr"] = localData.heartRate;
-    doc["spo2"] = localData.spo2;
-    doc["temp"] = localData.temperature;
-    doc["pres"] = localData.pressure;
-    doc["roll"] = localData.roll;
-    doc["pitch"] = localData.pitch;
-    doc["yaw"] = localData.yaw;
-    doc["mag"] = localData.magnitude;
-    doc["est"] = localData.estadoGlobal;
-    doc["fall"] = localData.fallDetected ? 1 : 0;
-    doc["sig"] = localData.signalQuality ? 1 : 0;
+  StaticJsonDocument<512> doc;
+  doc["hr"] = localData.heartRate;
+  doc["spo2"] = localData.spo2;
+  doc["temp"] = localData.temperature;
+  doc["pres"] = localData.pressure;
+  doc["roll"] = localData.roll;
+  doc["pitch"] = localData.pitch;
+  doc["yaw"] = localData.yaw;
+  doc["mag"] = localData.magnitude;
+  doc["est"] = localData.estadoGlobal;
+  doc["fall"] = localData.fallDetected ? 1 : 0;
+  doc["sig"] = localData.signalQuality ? 1 : 0;
 
-    String jsonResponse;
-    serializeJson(doc, jsonResponse);
-    events.send(jsonResponse.c_str(), "telemetry", millis());
-    }
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+  events.send(jsonResponse.c_str(), "telemetry", millis());
+}
