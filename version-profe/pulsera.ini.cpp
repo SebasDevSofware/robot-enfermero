@@ -13,13 +13,27 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include "esp_mac.h"
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
 
 // ==================== CONFIGURACIÓN ====================
 #define I2C_SDA 21
 #define I2C_SCL 22
-#define ESP_NOW_CHANNEL 1                    // ¡CRÍTICO! Canal fijo 1
+#define ESP_NOW_CHANNEL 1
 #define MAX30102_SAMPLES 100
 #define SIGNAL_QUALITY_THRESHOLD 50000
+
+// Configuración OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDRESS 0x3C
+
+// Umbrales de Resiliencia y Energía
+const unsigned long WATCHDOG_TIMEOUT = 2000;
+const unsigned long INACTIVITY_TIMEOUT = 300000; // 5 min para modo ahorro
+const float MOTION_THRESHOLD = 0.15;
+const unsigned long OLED_INTERVAL = 500;
 
 // === MAC ADDRESS DEL ROBOT (¡CAMBIA ESTO POR LA MAC REAL DE TU ROBOT!) ===
 // Para obtener la MAC: sube el código temporal al robot y copia el valor
@@ -31,7 +45,7 @@ typedef struct __attribute__((packed)) {
   uint32_t timestamp;      // 4 bytes - Tiempo del dato
   int32_t heartRate;       // 4 bytes - Latidos por minuto
   int32_t spo2;            // 4 bytes - Saturación de oxígeno (%)
-  float temperature;       // 4 bytes - Temperatura (°C)
+  float temperature;       // 4 bytes - Temperatura Ambiental (°C)
   float pressure;          // 4 bytes - Presión atmosférica (hPa)
   float roll;              // 4 bytes - Rotación en eje X (grados)
   float pitch;             // 4 bytes - Rotación en eje Y (grados)
@@ -46,14 +60,19 @@ typedef struct __attribute__((packed)) {
 MAX30105 particleSensor;
 Adafruit_BMP280 bme;
 MPU9250 mpu;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-bool bme_present = false;
-bool mpu_present = false;
-bool max_present = false;
+
+bool bme_present = false, mpu_present = false, max_present = false, oled_present = false;
+bool lowPowerMode = false;
+unsigned long lastMotionTime = 0;
 
 TelemetryPacket packet;
 SemaphoreHandle_t i2cMutex;
 SemaphoreHandle_t dataMutex;
+
+TaskHandle_t bioTaskHandle = NULL, imuTaskHandle = NULL;
+unsigned long lastTaskReset[2] = {0, 0};
 
 // Buffers para MAX30102
 uint32_t irBuffer[MAX30102_SAMPLES];
@@ -64,6 +83,29 @@ uint32_t samplesCollected = 0;
 int32_t lastStableHR = 75;
 int32_t lastStableSpO2 = 97;
 bool signalGood = false;
+
+// ==================== FUNCIONES DE RESILIENCIA ====================
+void resetI2CBus() {
+  Serial.println("[WATCHDOG] Fallo I2C detectado. Reiniciando bus...");
+  Wire.end();
+  delay(100);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+}
+
+void checkWatchdog() {
+  unsigned long now = millis();
+  if (now - lastTaskReset[0] > WATCHDOG_TIMEOUT) {
+    Serial.println("[CRÍTICO] Tarea Biometría colgada.");
+    resetI2CBus();
+    lastTaskReset[0] = now;
+  }
+  if (now - lastTaskReset[1] > WATCHDOG_TIMEOUT * 2) {
+    Serial.println("[CRÍTICO] Tarea IMU colgada.");
+    resetI2CBus();
+    lastTaskReset[1] = now;
+  }
+}
 
 // Filtro Madgwick para IMU
 float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
@@ -107,6 +149,9 @@ void BiometricTask(void *pvParameters) {
   int8_t validSPO2, validHR;
   
   while (true) {
+    lastTaskReset[0] = millis();
+    if (lowPowerMode) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+
     if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       
       // Leer MAX30102 (oxímetro)
@@ -183,6 +228,7 @@ void BiometricTask(void *pvParameters) {
 // ==================== TAREA IMU (CORE 1) ====================
 void IMUTask(void *pvParameters) {
   while (true) {
+    lastTaskReset[1] = millis();
     if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       if (mpu_present && mpu.update()) {
         unsigned long now = micros();
@@ -191,15 +237,9 @@ void IMUTask(void *pvParameters) {
         if (dt > 0.05f) dt = 0.01f;
         lastMPURead = now;
         
-        float ax = mpu.getAccX();
-        float ay = mpu.getAccY();
-        float az = mpu.getAccZ();
-        float gx = mpu.getGyroX();
-        float gy = mpu.getGyroY();
-        float gz = mpu.getGyroZ();
-        float mx = mpu.getMagX();
-        float my = mpu.getMagY();
-        float mz = mpu.getMagZ();
+        float ax = mpu.getAccX(), ay = mpu.getAccY(), az = mpu.getAccZ();
+        float gx = mpu.getGyroX(), gy = mpu.getGyroY(), gz = mpu.getGyroZ();
+        float mx = mpu.getMagX(), my = mpu.getMagY(), mz = mpu.getMagZ();
         
         updateOrientation(ax, ay, az, gx, gy, gz, mx, my, mz, dt);
         
@@ -214,15 +254,21 @@ void IMUTask(void *pvParameters) {
         float yaw = atan2(2.0f * (q0 * q3 + q1 * q2), 
                    1.0f - 2.0f * (q2 * q2 + q3 * q3)) * 180.0f / PI;
         
+        // Lógica Low Power
+        if (mag < (1.0f + MOTION_THRESHOLD) && mag > (1.0f - MOTION_THRESHOLD)) {
+          if (millis() - lastMotionTime > INACTIVITY_TIMEOUT && !lowPowerMode) {
+            lowPowerMode = true;
+          }
+        } else {
+          lastMotionTime = millis();
+          lowPowerMode = false;
+        }
+
         // Detectar caída (impacto > 3.5G)
         bool fallDetected = (mag > 3.5f);
         
         // Ajustar intervalo de envío según movimiento
-        if (mag > 2.0f) {
-          sendInterval = 50;   // Más rápido si hay movimiento
-        } else {
-          sendInterval = 100;  // Normal
-        }
+        sendInterval = (mag > 2.0f) ? 50 : 100;
         
         if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
           packet.magnitude = mag;
@@ -240,12 +286,44 @@ void IMUTask(void *pvParameters) {
   }
 }
 
+// ==================== TAREA CORE 1: INTERFAZ OLED ====================
+void DisplayTask(void *pvParameters) {
+  while (true) {
+    if (oled_present) {
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (lowPowerMode) {
+          display.clearDisplay(); display.display();
+          display.ssd1306_command(SSD1306_DISPLAYOFF);
+          xSemaphoreGive(i2cMutex);
+          while (lowPowerMode) vTaskDelay(pdMS_TO_TICKS(500));
+          display.ssd1306_command(SSD1306_DISPLAYON);
+        } else {
+          display.clearDisplay();
+          display.setTextSize(1); display.setTextColor(WHITE);
+          display.setCursor(0,0);
+          display.printf("BPM: %d  SpO2: %d%%", packet.heartRate, packet.spo2);
+          display.setCursor(0,15);
+          display.printf("Temp: %.1f C", packet.temperature);
+          display.setCursor(0,30);
+          display.printf("Acc: %.2f G", packet.magnitude);
+          display.setCursor(0,45);
+          display.printf("EST: %s", packet.fallDetected ? "!!!CAIDA!!!" : (signalGood ? "OK" : "BUSCANDO"));
+          if (signalGood) display.fillRect(115, 0, 12, 6, WHITE);
+          display.display();
+          xSemaphoreGive(i2cMutex);
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(OLED_INTERVAL));
+  }
+}
+
 // ==================== TAREA ENVÍO ESP-NOW ====================
 void SendTask(void *pvParameters) {
   while (true) {
     unsigned long now = millis();
     
-    if (now - lastSendTime >= sendInterval) {
+    if (now - lastSendTime >= sendInterval && !lowPowerMode) {
       sendTelemetry();
       lastSendTime = now;
     }
@@ -464,6 +542,15 @@ void setup() {
   // Inicializar sensores
   if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
     
+    // OLED
+    oled_present = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
+    if (oled_present) {
+      display.clearDisplay();
+      display.setTextSize(1); display.setTextColor(WHITE);
+      display.setCursor(0,0); display.println("INICIANDO...");
+      display.display();
+    }
+
     // MAX30102 (oxímetro)
     max_present = particleSensor.begin(Wire, I2C_SPEED_FAST);
     if (max_present) {
@@ -534,16 +621,19 @@ void setup() {
   }
   
   // Crear tareas en cores específicos
-  xTaskCreatePinnedToCore(BiometricTask, "BiometricTask", 8192, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(IMUTask, "IMUTask", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(SendTask, "SendTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(BiometricTask, "Bio", 8192, NULL, 2, &bioTaskHandle, 0);
+  xTaskCreatePinnedToCore(IMUTask, "IMU", 4096, NULL, 2, &imuTaskHandle, 1);
+  xTaskCreatePinnedToCore(SendTask, "Send", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(DisplayTask, "OLED", 4096, NULL, 1, NULL, 1);
   
+  lastMotionTime = millis();
   Serial.print("[OK] Sistema listo - Transmitiendo en canal ");
   Serial.println(ESP_NOW_CHANNEL);
   Serial.println("[INFO] Esperando conexión con el Robot...\n");
 }
 
-// ==================== LOOP VACÍO (todo en tareas RTOS) ====================
+// ==================== LOOP (Mantenimiento y Watchdog) ====================
 void loop() {
+  checkWatchdog();
   vTaskDelay(pdMS_TO_TICKS(1000));
 }

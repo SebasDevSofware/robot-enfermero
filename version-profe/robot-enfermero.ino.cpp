@@ -15,22 +15,22 @@
 // ==================== CONFIGURACIÓN DE RED ====================
 #define AP_SSID "BIOCHRONORITMIC_IA_CENTER"
 #define AP_PASS "12345678"
-#define ESP_NOW_CHANNEL 1                    // ¡CRÍTICO! Mismo canal que la pulsera
+#define ESP_NOW_CHANNEL 1
 
 // ==================== CONFIGURACIÓN PINES =====================
 #define BUZZER_PIN 18
 #define LED_PIN 22
 // Motor A (Izquierdo)
-#define IN1_MOTORES 27
-#define IN2_MOTORES 14
-#define ENA_MOTORES 13
+#define IN1_MOTORES 25
+#define IN2_MOTORES 26
+#define ENA_MOTORES 4
 // Motor B (Derecho)
 #define IN3_MOTORES 32
 #define IN4_MOTORES 33
-#define ENB_MOTORES 2
+#define ENB_MOTORES 12
 // Sensor Ultrasónico HC-SR04
-#define TRIG_PIN 17
-#define ECHO_PIN 16
+#define TRIG_PIN 17 // Naranja
+#define ECHO_PIN 16 // Verde
 
 // ==================== UMBRALES MÉDICOS ====================
 #define HR_NORMAL_MIN 60
@@ -49,7 +49,7 @@ typedef struct __attribute__((packed)) {
   uint32_t timestamp;      // 4 bytes
   int32_t heartRate;       // 4 bytes
   int32_t spo2;            // 4 bytes
-  float temperature;       // 4 bytes
+  float temperature;       // 4 bytes (temperatura ambiental)
   float pressure;          // 4 bytes
   float roll;              // 4 bytes
   float pitch;             // 4 bytes
@@ -100,7 +100,7 @@ char tendenciaSpO2[10] = "ESTABLE";
 float umbralSpO2Dinamico = 94.0f;
 
 // Buffers para derivadas (ventana deslizante)
-#define BUFFER_SIZE 10
+#define BUFFER_SIZE 20
 float hrBuffer[BUFFER_SIZE];
 float spo2Buffer[BUFFER_SIZE];
 float tempBuffer[BUFFER_SIZE];
@@ -127,6 +127,7 @@ void motoresInit();
 void motoresDetener();
 void motoresAvanzar(int velocidad);
 void motoresRetroceder(int velocidad);
+void motoresGirar(int velocidad);
 float leerDistanciaUltrasonico();
 float calcularAltitud(float presionHpa);
 void alertaEmergencia(int duracionMs);
@@ -204,16 +205,26 @@ void TaskSafety(void *pvParameters) {
 // ==================== TAREA ACTUADORES (LED + BUZZER) ====================
 void TaskActuators(void *pvParameters) {
   while (true) {
-    if (nivelRiesgoIA >= 2 || fallUrgent) {
+    if (nivelRiesgoIA >= 3 || fallUrgent) {
+      // EMERGENCIA CRÍTICA: LED + BUZZER AGUDO + GIRO
       digitalWrite(LED_PIN, HIGH);
-      if (nivelRiesgoIA >= 3) {
-        tone(BUZZER_PIN, 2500, 200);
+      tone(BUZZER_PIN, 2500, 200);
+      
+      if (!killSwitchActive) {
+        motoresGirar(200); // Gira en círculos para llamar la atención
       } else {
-        tone(BUZZER_PIN, 1000, 100);
+        motoresDetener();  // Prioridad: no chocar si hay algo cerca
       }
+    } else if (nivelRiesgoIA == 2) {
+      // ALERTA: LED + BUZZER LENTO + MOTORES PARADOS
+      digitalWrite(LED_PIN, HIGH);
+      tone(BUZZER_PIN, 1000, 100);
+      motoresDetener();
     } else {
+      // NORMALIDAD
       digitalWrite(LED_PIN, LOW);
       noTone(BUZZER_PIN);
+      motoresDetener();
     }
     
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -268,6 +279,15 @@ void motoresRetroceder(int velocidad) {
   digitalWrite(IN1_MOTORES, LOW);
   digitalWrite(IN2_MOTORES, HIGH);
   digitalWrite(IN3_MOTORES, LOW);
+  digitalWrite(IN4_MOTORES, HIGH);
+  analogWrite(ENA_MOTORES, velocidad);
+  analogWrite(ENB_MOTORES, velocidad);
+}
+
+void motoresGirar(int velocidad) {
+  digitalWrite(IN1_MOTORES, HIGH); // Motor A adelante
+  digitalWrite(IN2_MOTORES, LOW);
+  digitalWrite(IN3_MOTORES, LOW);  // Motor B atrás
   digitalWrite(IN4_MOTORES, HIGH);
   analogWrite(ENA_MOTORES, velocidad);
   analogWrite(ENB_MOTORES, velocidad);
@@ -618,14 +638,13 @@ void setup() {
   motoresInit();
   
   // Tono de inicio
-  tone(BUZZER_PIN, 1000, 200);
+  digitalWrite(BUZZER_PIN, HIGH);
   delay(250);
-  tone(BUZZER_PIN, 1500, 200);
+  digitalWrite(BUZZER_PIN, LOW);
   
   // ==================== CONFIGURACIÓN WIFI (AP + ESP-NOW) ====================
   WiFi.mode(WIFI_AP_STA);
   
-  // ¡CRÍTICO! Forzar AP en canal 1 (mismo que ESP-NOW)
   IPAddress local_IP(192, 168, 4, 1);
   IPAddress gateway(192, 168, 4, 1);
   IPAddress subnet(255, 255, 255, 0);
@@ -639,10 +658,8 @@ void setup() {
   Serial.print("[WIFI] IP: ");
   Serial.println(WiFi.softAPIP());
   
-  // Mostrar MAC del robot (para copiar en la pulsera)
   printRobotMAC();
   
-  // ¡CRÍTICO! Fijar la radio al canal 1 (evita saltos de frecuencia)
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(ESP_NOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
@@ -684,7 +701,7 @@ void setup() {
   
   // Crear tareas en cores específicos
   xTaskCreatePinnedToCore(TaskProcessTelemetry, "ProcessTelemetry", 8192, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(TaskSafety, "SafetyTask", 4096, NULL, 3, NULL, 0);    // Prioridad máxima
+  xTaskCreatePinnedToCore(TaskSafety, "SafetyTask", 4096, NULL, 3, NULL, 0);
   xTaskCreatePinnedToCore(TaskActuators, "ActuatorsTask", 4096, NULL, 1, NULL, 1);
   
   // Inicializar buffers
@@ -696,6 +713,9 @@ void setup() {
   
   Serial.println("\n[ROBOT] ✅ Sistema listo - Esperando datos de la pulsera...");
   Serial.println("[INFO] Conéctate a la WiFi 'BIOCHRONORITMIC_IA_CENTER' y ve a http://192.168.4.1\n");
+  digitalWrite(LED_PIN, HIGH);
+  delay(100);
+  digitalWrite(LED_PIN, LOW);
 }
 
 // ==================== LOOP PRINCIPAL ====================
