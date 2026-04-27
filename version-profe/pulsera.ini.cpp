@@ -35,6 +35,11 @@ const unsigned long INACTIVITY_TIMEOUT = 300000; // 5 min para modo ahorro
 const float MOTION_THRESHOLD = 0.15;
 const unsigned long OLED_INTERVAL = 500;
 
+// Umbrales de Detección de Caídas Profesional
+#define FALL_IMPACT_THRESHOLD 3.5
+#define FALL_INACTIVITY_TIME 3000
+#define FALL_ANGLE_THRESHOLD 50
+
 // === MAC ADDRESS DEL ROBOT (¡CAMBIA ESTO POR LA MAC REAL DE TU ROBOT!) ===
 // Para obtener la MAC: sube el código temporal al robot y copia el valor
 uint8_t robotMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // ¡CAMBIA AQUÍ!
@@ -66,6 +71,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool bme_present = false, mpu_present = false, max_present = false, oled_present = false;
 bool lowPowerMode = false;
 unsigned long lastMotionTime = 0;
+unsigned long fallTimestamp = 0; // Seguimiento del tiempo de la caída
 
 TelemetryPacket packet;
 SemaphoreHandle_t i2cMutex;
@@ -264,8 +270,47 @@ void IMUTask(void *pvParameters) {
           lowPowerMode = false;
         }
 
-        // Detectar caída (impacto > 3.5G)
-        bool fallDetected = (mag > 3.5f);
+        // ================= DETECCIÓN DE CAÍDAS PROFESIONAL =================
+        bool currentFall = false;
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          currentFall = (packet.fallDetected == 1);
+          xSemaphoreGive(dataMutex);
+        }
+
+        // 1. Detección de Impacto
+        if (mag > FALL_IMPACT_THRESHOLD && !currentFall) {
+          currentFall = true;
+          fallTimestamp = millis();
+          Serial.println("!!! IMPACTO DETECTADO - ANALIZANDO !!!");
+        }
+
+        // 2. Análisis y Confirmación
+        if (currentFall) {
+          unsigned long timeSinceImpact = millis() - fallTimestamp;
+          
+          if (timeSinceImpact > FALL_INACTIVITY_TIME) {
+            // Si después del tiempo de espera hay estabilidad (inactividad)
+            if (mag > 0.8f && mag < 1.2f) {
+              // Confirmar por ángulo (si está muy inclinado/acostado)
+              if (abs(pitch) > FALL_ANGLE_THRESHOLD) {
+                // Caída Confirmada - Se mantiene currentFall en true
+                static unsigned long lastAlert = 0;
+                if(millis() - lastAlert > 1000) {
+                  Serial.println("!!! CAIDA CONFIRMADA !!!");
+                  lastAlert = millis();
+                }
+              } else {
+                // Falsa alarma: posición vertical o recuperado
+                currentFall = false;
+                Serial.println("[Caída] Falsa alarma: Posición vertical.");
+              }
+            } else {
+              // Falsa alarma: se detectó movimiento normal tras el impacto
+              currentFall = false;
+              Serial.println("[Caída] Falsa alarma: Movimiento detectado.");
+            }
+          }
+        }
         
         // Ajustar intervalo de envío según movimiento
         sendInterval = (mag > 2.0f) ? 50 : 100;
@@ -275,7 +320,7 @@ void IMUTask(void *pvParameters) {
           packet.roll = roll;
           packet.pitch = pitch;
           packet.yaw = yaw;
-          packet.fallDetected = fallDetected ? 1 : 0;
+          packet.fallDetected = currentFall ? 1 : 0;
           xSemaphoreGive(dataMutex);
         }
       }

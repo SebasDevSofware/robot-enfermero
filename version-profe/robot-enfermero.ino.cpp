@@ -29,8 +29,8 @@
 #define IN4_MOTORES 33
 #define ENB_MOTORES 12
 // Sensor Ultrasónico HC-SR04
-#define TRIG_PIN 17 // Naranja
-#define ECHO_PIN 16 // Verde
+#define TRIG_PIN 5 // Naranja
+#define ECHO_PIN 35 // Verde
 
 // ==================== UMBRALES MÉDICOS ====================
 #define HR_NORMAL_MIN 60
