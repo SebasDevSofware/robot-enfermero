@@ -90,6 +90,36 @@ int32_t lastStableHR = 75;
 int32_t lastStableSpO2 = 97;
 bool signalGood = false;
 
+// Filtros Biométricos (Promedio Móvil de 10 muestras y análisis de tendencia)
+#define BIO_FILTER_SIZE 10
+int32_t hrHistory[BIO_FILTER_SIZE];
+int32_t spo2History[BIO_FILTER_SIZE];
+int hrFilterIndex = 0, spo2FilterIndex = 0;
+bool hrFilterFull = false, spo2FilterFull = false;
+
+int32_t applyBioFilter(int32_t newValue, int32_t* buffer, int& index, bool& full, int32_t lastValue, int32_t maxDelta) {
+  // Contextualización biológica: si el cambio es muy brusco, suavizarlo hacia la tendencia
+  if (full || index > 0) {
+    if (abs(newValue - lastValue) > maxDelta) {
+      newValue = lastValue + (newValue > lastValue ? (maxDelta / 2) : -(maxDelta / 2));
+    }
+  }
+  
+  buffer[index] = newValue;
+  index = (index + 1) % BIO_FILTER_SIZE;
+  if (index == 0) full = true;
+
+  int count = full ? BIO_FILTER_SIZE : index;
+  int32_t sum = 0;
+  for (int i = 0; i < count; i++) sum += buffer[i];
+  return sum / count;
+}
+
+void resetBioFilters() {
+  hrFilterIndex = 0; spo2FilterIndex = 0;
+  hrFilterFull = false; spo2FilterFull = false;
+}
+
 // ==================== FUNCIONES DE RESILIENCIA ====================
 void resetI2CBus() {
   Serial.println("[WATCHDOG] Fallo I2C detectado. Reiniciando bus...");
@@ -182,11 +212,16 @@ void BiometricTask(void *pvParameters) {
                                                     &spo2, &validSPO2, &hr, &validHR);
             
             if (validHR && hr >= 45 && hr <= 180) {
-              lastStableHR = hr;
+              // Aplicar filtro promediado con lógica biológica (máx delta 15 BPM)
+              lastStableHR = applyBioFilter(hr, hrHistory, hrFilterIndex, hrFilterFull, lastStableHR, 15);
             }
             if (validSPO2 && spo2 >= 85 && spo2 <= 100) {
-              lastStableSpO2 = spo2;
+              // Aplicar filtro promediado con lógica biológica (máx delta 3%)
+              lastStableSpO2 = applyBioFilter(spo2, spo2History, spo2FilterIndex, spo2FilterFull, lastStableSpO2, 3);
             }
+          } else {
+            // Resetear filtros si la señal es mala para evitar promedios viciados
+            resetBioFilters();
           }
           
           // Shift buffers (ventana deslizante de 75 muestras)
